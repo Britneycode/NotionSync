@@ -17,7 +17,7 @@ from sync_lib.canonical import (
     split_rich_text,
     validate_path,
 )
-from sync_lib.executor import execute_plan
+from sync_lib.executor import _br_from_update_response, execute_plan
 from sync_lib.planner import (
     Action,
     Classification,
@@ -917,3 +917,360 @@ def test_read_page_multi_page_invalid_structure():
     content, block_id, struct_valid = remote.read_page("page123")
 
     assert struct_valid is False
+
+
+# --- remote: 更新页面属性（cmd_sync 主线 Task B，RENAME 用） ---
+
+
+def test_update_page_properties_calls_pages_update():
+    mock_client = Mock()
+    mock_client.pages.update.return_value = {"id": "p1"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    props = {"Name": "new.py", "Path": "new.py", "Directory": "src"}
+    remote.update_page_properties("p1", props)
+
+    mock_client.pages.update.assert_called_once_with(page_id="p1", properties=props)
+    assert remote.limiter.wait.call_count == 1
+
+
+# --- executor: BR 取写响应体（设计 5.5，H-I-1） ---
+
+
+def test_br_from_update_response_valid():
+    resp = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "line1\n"}, {"plain_text": "line2"}]},
+    }
+    assert _br_from_update_response(resp, "b1", "line1\nline2") == compute_hash("line1\nline2")
+
+
+def test_br_from_update_response_wrong_type():
+    resp = {"id": "b1", "type": "paragraph", "code": {"rich_text": [{"plain_text": "x"}]}}
+    assert _br_from_update_response(resp, "b1", "x") is None
+
+
+def test_br_from_update_response_wrong_id():
+    resp = {"id": "other", "type": "code", "code": {"rich_text": [{"plain_text": "x"}]}}
+    assert _br_from_update_response(resp, "b1", "x") is None
+
+
+def test_br_from_update_response_rich_text_not_list():
+    resp = {"id": "b1", "type": "code", "code": {"rich_text": "x"}}
+    assert _br_from_update_response(resp, "b1", "x") is None
+
+
+def test_br_from_update_response_missing_plain_text():
+    resp = {"id": "b1", "type": "code", "code": {"rich_text": [{"text": {"content": "x"}}]}}
+    assert _br_from_update_response(resp, "b1", "x") is None
+
+
+# --- executor: 全部动作（cmd_sync 主线 Task B） ---
+
+
+def test_execute_push_uses_response_for_br(tmp_path):
+    """H-I-1：PUSH 后 BR 取写响应体，而非直接沿用本地 hash。"""
+    (tmp_path / "test.md").write_text("new content")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.md", {
+        "page_id": "p1", "block_id": "b1",
+        "base_remote_hash": compute_hash("old content"),
+    })
+
+    remote = Mock()
+    remote.read_page.return_value = ("old content", "b1", True)
+    remote.update_block.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "new content"}]},
+    }
+
+    plan = {"test.md": Classification(Action.PUSH)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.pushed == 1
+    entry = mgr.get_file("test.md")
+    assert entry["base_remote_hash"] == compute_hash("new content")
+    assert entry["base_local_hash"] == compute_hash("new content")
+
+
+def test_execute_push_br_fallback_readback(tmp_path):
+    """写响应不完整时回退读回远端重算 BR。"""
+    (tmp_path / "test.md").write_text("new content")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.md", {
+        "page_id": "p1", "block_id": "b1",
+        "base_remote_hash": compute_hash("old content"),
+    })
+
+    remote = Mock()
+    # 第一次：写前校验；第二次：写响应不可用后的读回
+    remote.read_page.side_effect = [
+        ("old content", "b1", True),
+        ("new content", "b1", True),
+    ]
+    remote.update_block.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"text": {"content": "new content"}}]},  # 无 plain_text
+    }
+
+    plan = {"test.md": Classification(Action.PUSH)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.pushed == 1
+    assert mgr.get_file("test.md")["base_remote_hash"] == compute_hash("new content")
+
+
+def test_execute_push_valid_false_records_error(tmp_path):
+    """H-I-2：写前校验结构异常时不崩溃，记入 errors，且不调用 update_block。"""
+    (tmp_path / "test.md").write_text("new content")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.md", {
+        "page_id": "p1", "block_id": "b1",
+        "base_remote_hash": compute_hash("old content"),
+    })
+
+    remote = Mock()
+    remote.read_page.return_value = (None, None, False)
+
+    plan = {"test.md": Classification(Action.PUSH)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.pushed == 0
+    assert len(summary.errors) == 1
+    assert "invalid-structure" in summary.errors[0]["error"]
+    remote.update_block.assert_not_called()
+
+
+def test_execute_push_optimistic_conflict(tmp_path):
+    """6.6：写前校验发现远端已改 → 中止，不写入。"""
+    (tmp_path / "test.md").write_text("new content")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.md", {
+        "page_id": "p1", "block_id": "b1",
+        "base_remote_hash": compute_hash("old content"),
+    })
+
+    remote = Mock()
+    remote.read_page.return_value = ("changed remotely", "b1", True)
+
+    plan = {"test.md": Classification(Action.PUSH)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.pushed == 0
+    assert len(summary.errors) == 1
+    remote.update_block.assert_not_called()
+
+
+def test_execute_pull(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", {
+        "page_id": "p1", "block_id": "b1",
+        "format": {"encoding": "utf-8", "bom": False, "eol": "lf", "final_newline": False},
+    })
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote text", "b1", True)
+
+    plan = {"a.md": Classification(Action.PULL)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.pulled == 1
+    assert (tmp_path / "a.md").read_text() == "remote text"
+    entry = mgr.get_file("a.md")
+    assert entry["base_local_hash"] == compute_hash("remote text")
+    assert entry["base_remote_hash"] == compute_hash("remote text")
+    assert entry["block_id"] == "b1"
+
+
+def test_execute_create_remote(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+
+    remote = Mock()
+    remote.create_page.return_value = "page-new"
+    remote.read_page.return_value = ("print('hi')", "block-new", True)
+
+    plan = {"src/main.py": Classification(Action.CREATE_REMOTE)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.created == 1
+    args = remote.create_page.call_args[0]
+    assert args[0] == "src/main.py"
+    assert args[1] == "print('hi')"
+    assert args[2] == "python"
+    assert args[3] == "src"
+    assert args[4] == 11  # len(canonical("print('hi')"))
+
+    entry = mgr.get_file("src/main.py")
+    assert entry["page_id"] == "page-new"
+    assert entry["block_id"] == "block-new"
+    assert entry["base_local_hash"] == compute_hash("print('hi')")
+    assert entry["base_remote_hash"] == compute_hash("print('hi')")
+    assert entry["status"] == "synced"
+    assert entry["format"]["eol"] == "lf"
+
+
+def test_execute_adopt(tmp_path):
+    (tmp_path / "a.md").write_text("same")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+
+    remote = Mock()
+    remote.read_page.return_value = ("same", "b1", True)
+
+    plan = {"a.md": Classification(Action.ADOPT, meta={"page_id": "p1"})}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.adopted == 1
+    entry = mgr.get_file("a.md")
+    assert entry["page_id"] == "p1"
+    assert entry["block_id"] == "b1"
+    assert entry["base_remote_hash"] == compute_hash("same")
+    assert entry["status"] == "synced"
+
+
+def test_execute_adopt_mismatch_records_error(tmp_path):
+    (tmp_path / "a.md").write_text("local")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote", "b1", True)
+
+    plan = {"a.md": Classification(Action.ADOPT, meta={"page_id": "p1"})}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.adopted == 0
+    assert len(summary.errors) == 1
+
+
+def test_execute_archive_remote(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("gone.md", {"page_id": "p1", "base_remote_hash": compute_hash("x")})
+
+    remote = Mock()
+    remote.read_page.return_value = ("x", "b1", True)
+
+    plan = {"gone.md": Classification(Action.ARCHIVE_REMOTE)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.archived == 1
+    remote.archive_page.assert_called_once_with("p1")
+    assert "gone.md" not in mgr.state["files"]
+    assert mgr.state["tombstones"]["gone.md"]["page_id"] == "p1"
+
+
+def test_execute_archive_remote_conflict(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("gone.md", {"page_id": "p1", "base_remote_hash": compute_hash("x")})
+
+    remote = Mock()
+    remote.read_page.return_value = ("changed", "b1", True)
+
+    plan = {"gone.md": Classification(Action.ARCHIVE_REMOTE)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.archived == 0
+    assert len(summary.errors) == 1
+    remote.archive_page.assert_not_called()
+
+
+def test_execute_delete_local(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "x.md").write_text("content")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("sub/x.md", {"page_id": "p1"})
+
+    plan = {"sub/x.md": Classification(Action.DELETE_LOCAL)}
+    summary = execute_plan(plan, mgr, Mock(), tmp_path, {})
+
+    assert summary.deleted == 1
+    assert not (tmp_path / "sub" / "x.md").exists()
+    backup = tmp_path / ".sync-backup" / "deleted" / "sub" / "x.md"
+    assert backup.read_text() == "content"
+    assert "sub/x.md" not in mgr.state["files"]
+    assert mgr.state["tombstones"]["sub/x.md"]["page_id"] == "p1"
+
+
+def test_execute_rename(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("old.py", {"page_id": "p1", "base_local_hash": "h"})
+
+    remote = Mock()
+    remote.update_page_properties.return_value = {"id": "p1"}
+
+    plan = {"old.py": Classification(
+        Action.RENAME, meta={"new_path": "src/new.py", "page_id": "p1"})}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.renamed == 1
+    args = remote.update_page_properties.call_args[0]
+    assert args[0] == "p1"
+    assert args[1] == {"Name": "src/new.py", "Path": "src/new.py", "Directory": "src"}
+    assert "old.py" not in mgr.state["files"]
+    assert mgr.state["files"]["src/new.py"]["page_id"] == "p1"
+
+
+def test_execute_baseline(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", {
+        "page_id": "p1", "base_local_hash": "old", "base_remote_hash": "old"})
+
+    remote = Mock()
+    remote.read_page.return_value = ("same", "b1", True)
+
+    plan = {"a.md": Classification(Action.BASELINE)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.baselined == 1
+    entry = mgr.get_file("a.md")
+    assert entry["base_local_hash"] == compute_hash("same")
+    assert entry["base_remote_hash"] == compute_hash("same")
+    assert entry["status"] == "synced"
+
+
+def test_execute_conflict_backs_up_remote(tmp_path):
+    (tmp_path / "a.md").write_text("local version")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", {"page_id": "p1"})
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote version", "b1", True)
+
+    plan = {"a.md": Classification(Action.CONFLICT)}
+    summary = execute_plan(plan, mgr, remote, tmp_path, {})
+
+    assert summary.conflicts == 1
+    # 本地不动
+    assert (tmp_path / "a.md").read_text() == "local version"
+    backups = list((tmp_path / ".sync-backup" / "conflicts").glob("a.md.remote-*.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "remote version"
+    assert mgr.get_file("a.md")["status"] == "conflict"

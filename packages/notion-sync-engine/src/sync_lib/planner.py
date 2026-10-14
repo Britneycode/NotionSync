@@ -25,6 +25,7 @@ class Action(Enum):
 class Classification:
     action: Action
     reason: str = ""
+    meta: dict = None
 
 
 def classify_file(state_entry, local_hash, remote_hash, remote_exists, remote_struct_valid):

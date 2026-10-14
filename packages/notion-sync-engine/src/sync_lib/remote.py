@@ -157,6 +157,13 @@ class NotionRemote:
             page_id=page_id, in_trash=True,
         ))
 
+    def update_page_properties(self, page_id, properties):
+        """更新页面属性（RENAME 用：Name / Path / Directory）"""
+        self.limiter.wait()
+        return retry_with_backoff(lambda: self.client.pages.update(
+            page_id=page_id, properties=properties,
+        ))
+
     @staticmethod
     def _extract_path(page):
         """取 page.properties["Path"] 首个 rich_text 的 plain_text，缺失/空 → None"""
