@@ -10,14 +10,17 @@ import pytest
 
 from sync_lib.canonical import (
     canonical,
+    compute_hash,
     detect_format,
     normalize_path,
     restore_format,
     split_rich_text,
     validate_path,
 )
+from sync_lib.executor import execute_plan
 from sync_lib.planner import (
     Action,
+    Classification,
     classify_existence,
     classify_file,
     detect_renames,
@@ -599,3 +602,53 @@ def test_read_page_invalid_structure_multiple_blocks():
     content, block_id, struct_valid = remote.read_page("page123")
 
     assert struct_valid is False
+
+
+def test_update_block_splits_rich_text():
+    mock_client = Mock()
+    mock_client.blocks.update.return_value = {"last_edited_time": "2026-10-14T12:00:00Z"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    result = remote.update_block("block123", "a" * 2001)
+
+    assert result == {"last_edited_time": "2026-10-14T12:00:00Z"}
+    mock_client.blocks.update.assert_called_once()
+    call_args = mock_client.blocks.update.call_args[1]
+    assert call_args["block_id"] == "block123"
+    rich_text = call_args["code"]["rich_text"]
+    assert len(rich_text) == 2
+    assert rich_text[0]["text"]["content"] == "a" * 2000
+    assert rich_text[1]["text"]["content"] == "a"
+
+
+# --- executor: 执行计划（PUSH/PULL + 乐观并发校验） ---
+
+
+def test_execute_push(tmp_path):
+    # 准备
+    (tmp_path / "test.md").write_text("new content")
+
+    state_mgr = Mock()
+    remote = Mock()
+    remote.read_page.return_value = ("old content", "block123", True)
+    remote.update_block.return_value = {"last_edited_time": "2026-10-14T12:00:00Z"}
+
+    # 最小改动：Mock 的 get_file 默认返回 Mock，无法下标访问；
+    # 设为真实 dict 使写前校验通过（见 brief 授权）
+    state_mgr.get_file.return_value = {
+        "page_id": "p1",
+        "block_id": "b1",
+        "base_remote_hash": compute_hash("old content"),
+        "format": {"encoding": "utf-8", "bom": False, "eol": "lf", "final_newline": False},
+    }
+
+    plan = {"test.md": Classification(Action.PUSH)}
+
+    # 执行
+    summary = execute_plan(plan, state_mgr, remote, tmp_path, {})
+
+    # 验证
+    assert summary.pushed == 1
+    remote.update_block.assert_called_once()
+    state_mgr.set_pending.assert_called_once()
+    state_mgr.clear_pending.assert_called_once()

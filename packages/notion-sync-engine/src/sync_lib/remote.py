@@ -121,6 +121,16 @@ class NotionRemote:
 
         return content, block["id"], True
 
+    def update_block(self, block_id: str, content: str) -> dict:
+        """替换 code block 的全部 rich_text 内容（按 UTF-16 码元切分，≤2000/段）"""
+        from .canonical import split_rich_text
+        self.limiter.wait()
+        chunks = split_rich_text(content, max_units=2000)
+        rich_text = [{"type": "text", "text": {"content": c}} for c in chunks]
+        return retry_with_backoff(
+            lambda: self.client.blocks.update(block_id=block_id, code={"rich_text": rich_text}),
+        )
+
     def _map_language(self, file_type):
         """映射文件类型到 Notion language"""
         mapping = {
