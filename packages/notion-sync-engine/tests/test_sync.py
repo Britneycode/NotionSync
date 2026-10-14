@@ -1,6 +1,9 @@
 """Tests for the Notion sync canonical module (text normalization, format
 detection/restoration, rich_text splitting and path validation)."""
 
+import json
+import os
+
 from sync_lib.canonical import (
     canonical,
     detect_format,
@@ -14,6 +17,12 @@ from sync_lib.planner import (
     classify_existence,
     classify_file,
     detect_renames,
+)
+from sync_lib.state import (
+    StateManager,
+    acquire_lock,
+    cleanup_tmp_files,
+    release_lock,
 )
 
 
@@ -300,3 +309,109 @@ def test_detect_renames_remote_changed():
     remote_changed = {"old.py"}  # 远端已修改
     renames = detect_renames(state, local_snapshot, remote_changed)
     assert len(renames) == 0  # 远端修改时不重命名
+
+
+# --- state: 状态文件原子读写 ---
+
+
+def test_state_atomic_write(tmp_path):
+    state_file = tmp_path / ".sync-state.json"
+    mgr = StateManager(tmp_path)
+    mgr.state = {"schema_version": 2, "files": {"test.py": {"page_id": "123"}}}
+    mgr.save()
+
+    # 验证文件存在且内容正确
+    assert state_file.exists()
+    data = json.loads(state_file.read_text())
+    assert data["schema_version"] == 2
+    assert data["files"]["test.py"]["page_id"] == "123"
+
+    # 验证临时文件已清理
+    assert not (tmp_path / ".sync-state.json.sync-tmp").exists()
+
+
+def test_state_load_nonexistent(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    assert mgr.state == {"schema_version": 2, "files": {}, "tombstones": {}, "skipped": []}
+
+
+def test_state_load_existing(tmp_path):
+    state_file = tmp_path / ".sync-state.json"
+    state_file.write_text(json.dumps({"schema_version": 2, "files": {"a.py": {"page_id": "1"}}}))
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    assert mgr.state["files"]["a.py"]["page_id"] == "1"
+
+
+# --- state: pending 意图日志 ---
+
+
+def test_state_set_pending(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.py", {"page_id": "123", "base_local_hash": "abc"})
+    mgr.set_pending("test.py", "push", "abc")
+
+    entry = mgr.get_file("test.py")
+    assert entry["pending"]["op"] == "push"
+    assert entry["pending"]["content_hash"] == "abc"
+    assert "started_at" in entry["pending"]
+
+
+def test_state_clear_pending(tmp_path):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.py", {"page_id": "123"})
+    mgr.set_pending("test.py", "push", "abc")
+    mgr.clear_pending("test.py")
+
+    entry = mgr.get_file("test.py")
+    assert entry["pending"] is None
+
+
+def test_state_recover_pending_create_no_page_id(tmp_path):
+    """pending op=create 但无 page_id → 按 Path 查询"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("test.py", {"pending": {"op": "create", "content_hash": "abc"}})
+
+    recovered = mgr.recover_pending()
+    assert len(recovered) == 1
+    assert recovered[0]["path"] == "test.py"
+    assert recovered[0]["action"] == "adopt_or_skip"
+
+
+# --- state: 进程锁与清理 ---
+
+
+def test_acquire_lock_success(tmp_path):
+    lock_file = tmp_path / ".sync.lock"
+    assert acquire_lock(tmp_path) is True
+    assert lock_file.exists()
+    release_lock(tmp_path)
+    assert not lock_file.exists()
+
+
+def test_acquire_lock_already_locked(tmp_path):
+    lock_file = tmp_path / ".sync.lock"
+    # 写入一个存活进程的 PID
+    lock_file.write_text(json.dumps({"pid": os.getpid(), "started_at": "2026-10-14T00:00:00Z"}))
+    assert acquire_lock(tmp_path) is False
+
+
+def test_acquire_lock_stale(tmp_path):
+    lock_file = tmp_path / ".sync.lock"
+    # 写入一个不存在的 PID
+    lock_file.write_text(json.dumps({"pid": 99999, "started_at": "2026-10-14T00:00:00Z"}))
+    assert acquire_lock(tmp_path) is True  # 锁过期，可以获取
+
+
+def test_cleanup_tmp_files(tmp_path):
+    (tmp_path / "file1.sync-tmp").write_text("tmp")
+    (tmp_path / "file2.sync-tmp").write_text("tmp")
+    (tmp_path / "normal.txt").write_text("keep")
+    cleanup_tmp_files(tmp_path)
+    assert not (tmp_path / "file1.sync-tmp").exists()
+    assert not (tmp_path / "file2.sync-tmp").exists()
+    assert (tmp_path / "normal.txt").exists()
