@@ -17,7 +17,7 @@ from sync_lib.canonical import (
     split_rich_text,
     validate_path,
 )
-from sync_lib.executor import _br_from_update_response, execute_plan
+from sync_lib.executor import Summary, _br_from_update_response, execute_plan
 from sync_lib.plan import build_plan
 from sync_lib.planner import (
     Action,
@@ -1506,3 +1506,526 @@ def test_build_plan_trashed_remote_treated_as_absent():
     )
     # 远端在回收站 → 视为远端不存在：本地未改 → DELETE_LOCAL
     assert plan["a.md"].action == Action.DELETE_LOCAL
+
+
+# --- cli: cmd_sync 编排（cmd_sync 主线 Task D） ---
+
+
+class _Args:
+    """cmd_sync 需要的参数命名空间。"""
+
+    def __init__(self, command, dry_run=False, full=False):
+        self.command = command
+        self.dry_run = dry_run
+        self.full = full
+
+
+def _write_config(root):
+    (root / ".sync-config.yaml").write_text(
+        "include: ['*.md']\nexclude: []\nremote_overlap_minutes: 5\n"
+    )
+
+
+def _write_state(root, state):
+    (root / ".sync-state.json").write_text(json.dumps(state))
+
+
+def _patch_pipeline(monkeypatch, plan, summary=None, order=None, remote=None):
+    """把 cmd_sync 的外部依赖替换为可控 mock，返回 (mocks, remote)。"""
+    from sync_lib import cli
+
+    if remote is None:
+        remote = Mock()
+        remote.query_candidates.return_value = []
+        remote.query_by_paths.return_value = {}
+
+    def _rec(name, ret):
+        def _f(*a, **k):
+            if order is not None:
+                order.append(name)
+            return ret
+
+        return _f
+
+    mocks = {
+        "acquire_lock": Mock(side_effect=_rec("acquire_lock", True)),
+        "release_lock": Mock(side_effect=_rec("release_lock", None)),
+        "scan_local": Mock(side_effect=_rec("scan_local", LocalSnapshot())),
+        "build_plan": Mock(side_effect=_rec("build_plan", plan)),
+        "execute_plan": Mock(
+            side_effect=_rec(
+                "execute_plan",
+                summary if summary is not None else Summary(errors=[]),
+            )
+        ),
+        "Client": Mock(),
+        "NotionRemote": Mock(return_value=remote),
+    }
+    for name, mock in mocks.items():
+        monkeypatch.setattr(cli, name, mock)
+    return mocks, remote
+
+
+def test_cmd_sync_pipeline_order(tmp_path, monkeypatch):
+    """步骤顺序：acquire_lock → scan_local → build_plan → execute_plan → release_lock。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    order = []
+    mocks, _ = _patch_pipeline(
+        monkeypatch, {"a.md": Classification(Action.PUSH)}, order=order
+    )
+
+    cli.cmd_sync(_Args("sync"))
+
+    assert order == [
+        "acquire_lock",
+        "scan_local",
+        "build_plan",
+        "execute_plan",
+        "release_lock",
+    ]
+    mocks["execute_plan"].assert_called_once()
+
+
+def test_cmd_sync_passes_trashed_to_build_plan(tmp_path, monkeypatch):
+    """步骤 5 必须显式传第 5 参 remote_paths_trashed（Task C 评审 Important）。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        {
+            "id": "p1",
+            "path": "gone.md",
+            "last_edited_time": "2026-10-14T10:00:00Z",
+            "in_trash": True,
+        },
+    ]
+    captured = {}
+
+    def fake_build_plan(local, remote_index, state, config, trashed=None):
+        captured["trashed"] = trashed
+        captured["remote_index"] = remote_index
+        return {}
+
+    monkeypatch.setattr(cli, "Client", Mock())
+    monkeypatch.setattr(cli, "NotionRemote", Mock(return_value=remote))
+    monkeypatch.setattr(cli, "acquire_lock", Mock(return_value=True))
+    monkeypatch.setattr(cli, "release_lock", Mock())
+    monkeypatch.setattr(cli, "scan_local", Mock(return_value=LocalSnapshot()))
+    monkeypatch.setattr(cli, "build_plan", fake_build_plan)
+    monkeypatch.setattr(cli, "execute_plan", Mock(return_value=Summary(errors=[])))
+
+    cli.cmd_sync(_Args("sync", dry_run=True))
+
+    assert captured["trashed"] == {"gone.md"}
+    assert "gone.md" not in captured["remote_index"]
+    remote.read_page.assert_not_called()  # 回收站候选不做精判
+
+
+def test_cmd_sync_dry_run_executes_nothing(tmp_path, monkeypatch):
+    """--dry-run 只打印计划，不执行、不推进水位线。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+
+    cli.cmd_sync(_Args("sync", dry_run=True))
+
+    mocks["execute_plan"].assert_not_called()
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert "remote_watermark" not in state["notion"]
+
+
+def test_cmd_sync_status_is_read_only(tmp_path, monkeypatch):
+    """status 等价于 sync --dry-run：只读，不执行。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+
+    cli.cmd_sync(_Args("status"))
+
+    mocks["execute_plan"].assert_not_called()
+
+
+def test_cmd_sync_releases_lock_on_error(tmp_path, monkeypatch):
+    """finally 中释放锁，即使执行抛错。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+    mocks["execute_plan"].side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        cli.cmd_sync(_Args("sync"))
+
+    mocks["release_lock"].assert_called_once()
+
+
+def test_cmd_sync_exits_when_lock_held(tmp_path, monkeypatch, capsys):
+    """锁被占用时退出且不释放他人锁。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    release = Mock()
+    monkeypatch.setattr(cli, "acquire_lock", Mock(return_value=False))
+    monkeypatch.setattr(cli, "release_lock", release)
+
+    with pytest.raises(SystemExit):
+        cli.cmd_sync(_Args("sync"))
+
+    release.assert_not_called()
+    assert "另一个同步进程" in capsys.readouterr().out
+
+
+def test_cmd_sync_advances_watermark_on_success(tmp_path, monkeypatch):
+    """无 errors 时推进水位线并 save。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    _patch_pipeline(monkeypatch, {}, summary=Summary(errors=[]))
+
+    cli.cmd_sync(_Args("sync"))
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert state["notion"]["remote_watermark"].endswith("Z")
+
+
+def test_cmd_sync_no_watermark_on_errors(tmp_path, monkeypatch):
+    """有 errors 时不推进水位线。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    _patch_pipeline(
+        monkeypatch, {}, summary=Summary(errors=[{"path": "a.md", "error": "x"}])
+    )
+
+    cli.cmd_sync(_Args("sync"))
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert "remote_watermark" not in state["notion"]
+
+
+def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
+    """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    plan = {
+        "push.md": Classification(Action.PUSH),
+        "pull.md": Classification(Action.PULL),
+        "conflict.md": Classification(Action.CONFLICT),
+    }
+    mocks, _ = _patch_pipeline(monkeypatch, plan)
+
+    cli.cmd_sync(_Args("push"))
+
+    assert "远端有修改" in capsys.readouterr().out
+    executed = mocks["execute_plan"].call_args[0][0]
+    assert set(executed) == {"push.md"}
+
+
+def test_cmd_sync_pull_filters_to_pull_actions(tmp_path, monkeypatch):
+    """pull 只执行 PULL/DELETE_LOCAL/ADOPT（+BASELINE）。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    plan = {
+        "pull.md": Classification(Action.PULL),
+        "delete.md": Classification(Action.DELETE_LOCAL),
+        "adopt.md": Classification(Action.ADOPT),
+        "create.md": Classification(Action.CREATE_REMOTE),
+        "push.md": Classification(Action.PUSH),
+        "baseline.md": Classification(Action.BASELINE),
+    }
+    mocks, _ = _patch_pipeline(monkeypatch, plan)
+
+    cli.cmd_sync(_Args("pull"))
+
+    executed = mocks["execute_plan"].call_args[0][0]
+    assert set(executed) == {"pull.md", "delete.md", "adopt.md", "baseline.md"}
+
+
+def test_cmd_sync_sync_executes_all_executable(tmp_path, monkeypatch):
+    """sync 执行全部可执行动作，CONFLICT/SKIP 仍只报告。"""
+    from sync_lib import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    plan = {
+        "push.md": Classification(Action.PUSH),
+        "pull.md": Classification(Action.PULL),
+        "create.md": Classification(Action.CREATE_REMOTE),
+        "archive.md": Classification(Action.ARCHIVE_REMOTE),
+        "delete.md": Classification(Action.DELETE_LOCAL),
+        "rename.md": Classification(Action.RENAME),
+        "adopt.md": Classification(Action.ADOPT),
+        "baseline.md": Classification(Action.BASELINE),
+        "conflict.md": Classification(Action.CONFLICT),
+        "skip.md": Classification(Action.SKIP),
+    }
+    mocks, _ = _patch_pipeline(monkeypatch, plan)
+
+    cli.cmd_sync(_Args("sync"))
+
+    executed = mocks["execute_plan"].call_args[0][0]
+    assert set(executed) == {
+        "push.md",
+        "pull.md",
+        "create.md",
+        "archive.md",
+        "delete.md",
+        "rename.md",
+        "adopt.md",
+        "baseline.md",
+    }
+
+
+# --- cli: 动作过滤表（设计 6.1） ---
+
+
+def _filter_sample():
+    return {
+        "push.md": Classification(Action.PUSH),
+        "pull.md": Classification(Action.PULL),
+        "create.md": Classification(Action.CREATE_REMOTE),
+        "archive.md": Classification(Action.ARCHIVE_REMOTE),
+        "rename.md": Classification(Action.RENAME),
+        "adopt.md": Classification(Action.ADOPT),
+        "delete.md": Classification(Action.DELETE_LOCAL),
+        "conflict.md": Classification(Action.CONFLICT),
+        "baseline.md": Classification(Action.BASELINE),
+        "skip.md": Classification(Action.SKIP),
+    }
+
+
+def test_filter_plan_push_whitelist():
+    from sync_lib import cli
+
+    filtered = cli._filter_plan(_filter_sample(), "push")
+    assert set(filtered) == {
+        "push.md",
+        "create.md",
+        "archive.md",
+        "rename.md",
+        "adopt.md",
+        "baseline.md",
+    }
+
+
+def test_filter_plan_pull_whitelist():
+    from sync_lib import cli
+
+    filtered = cli._filter_plan(_filter_sample(), "pull")
+    assert set(filtered) == {"pull.md", "adopt.md", "delete.md", "baseline.md"}
+
+
+def test_filter_plan_sync_all_executable():
+    from sync_lib import cli
+
+    filtered = cli._filter_plan(_filter_sample(), "sync")
+    assert set(filtered) == {
+        "push.md",
+        "pull.md",
+        "create.md",
+        "archive.md",
+        "rename.md",
+        "adopt.md",
+        "delete.md",
+        "baseline.md",
+    }
+    # CONFLICT 始终只报告；SKIP 无动作
+    assert "conflict.md" not in filtered
+    assert "skip.md" not in filtered
+
+
+# --- cli: 写前本地路径校验（防符号链接逃逸） ---
+
+
+def test_check_local_containment_rejects_escape(tmp_path):
+    from sync_lib import cli
+
+    plan = {
+        "ok.md": Classification(Action.PULL),
+        "gone.md": Classification(Action.DELETE_LOCAL),
+        "push.md": Classification(Action.PUSH),
+        "../escape.md": Classification(Action.PULL),
+    }
+    safe, errors = cli._check_local_containment(plan, tmp_path)
+
+    assert set(safe) == {"ok.md", "gone.md", "push.md"}
+    assert len(errors) == 1
+    assert errors[0]["path"] == "../escape.md"
+
+
+# --- cli: remote_index 构建（设计 5.4） ---
+
+
+def test_build_remote_index_coarse_reads_candidates(tmp_path):
+    from sync_lib import cli
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {"remote_watermark": None}
+    mgr.update_file(
+        "a.md",
+        {"page_id": "p1", "base_remote_hash": "BR", "remote_edited_at": "old"},
+    )
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        {"id": "p1", "path": "a.md", "last_edited_time": "new", "in_trash": False},
+    ]
+    remote.read_page.return_value = ("content", "b1", True)
+
+    index, trashed = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+
+    assert index["a.md"]["page_id"] == "p1"
+    assert index["a.md"]["hash"] == compute_hash("content")
+    assert index["a.md"]["struct_valid"] is True
+    assert index["a.md"]["last_edited_time"] == "new"
+    assert mgr.state["files"]["a.md"]["remote_edited_at"] == "new"
+    assert trashed == set()
+    # watermark=None → 全量（since_iso=None）
+    remote.query_candidates.assert_called_once_with(None)
+
+
+def test_build_remote_index_non_candidate_uses_br(tmp_path):
+    from sync_lib import cli
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {"remote_watermark": "2026-10-14T00:00:00Z"}
+    mgr.update_file(
+        "b.md",
+        {"page_id": "p2", "base_remote_hash": "BR2", "remote_edited_at": "t2"},
+    )
+
+    remote = Mock()
+    remote.query_candidates.return_value = []
+
+    index, _ = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+
+    assert index["b.md"] == {
+        "page_id": "p2",
+        "hash": "BR2",
+        "struct_valid": True,
+        "last_edited_time": "t2",
+    }
+
+
+def test_build_remote_index_probes_adopt(tmp_path):
+    from sync_lib import cli
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {"remote_watermark": None}
+
+    snapshot = LocalSnapshot(
+        files={"new.md": {"hash": "h", "format": {}, "size_kb": 0.0}}
+    )
+    remote = Mock()
+    remote.query_candidates.return_value = []
+    remote.query_by_paths.return_value = {"new.md": "p9"}
+    remote.read_page.return_value = ("same", "b9", True)
+
+    index, _ = cli._build_remote_index(remote, mgr, {}, snapshot, False)
+
+    assert index["new.md"]["page_id"] == "p9"
+    assert index["new.md"]["hash"] == compute_hash("same")
+    remote.query_by_paths.assert_called_once_with(["new.md"])
+
+
+def test_build_remote_index_full_skips_coarse(tmp_path):
+    from sync_lib import cli
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {"remote_watermark": "2026-10-14T00:00:00Z"}
+    mgr.update_file(
+        "a.md",
+        {"page_id": "p1", "base_remote_hash": "BR", "remote_edited_at": "t"},
+    )
+
+    remote = Mock()
+    remote.read_page.return_value = ("content", "b1", True)
+
+    index, _ = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), True)
+
+    remote.query_candidates.assert_not_called()
+    assert index["a.md"]["page_id"] == "p1"
+    assert index["a.md"]["hash"] == compute_hash("content")
+
+
+def test_watermark_since_applies_overlap():
+    from sync_lib import cli
+
+    since = cli._watermark_since("2026-10-14T10:00:00Z", {"remote_overlap_minutes": 5})
+    assert since == "2026-10-14T09:55:00Z"
+
+
+def test_watermark_since_none_is_full():
+    from sync_lib import cli
+
+    assert cli._watermark_since(None, {}) is None
