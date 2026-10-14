@@ -12,6 +12,13 @@ from .state import StateManager, acquire_lock, cleanup_tmp_files, release_lock
 
 
 def main():
+    # Windows GBK 控制台无法输出 emoji/中文，重配为 UTF-8
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="Notion 双向同步")
     subparsers = parser.add_subparsers(dest="command")
 
