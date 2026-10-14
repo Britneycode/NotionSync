@@ -18,6 +18,7 @@ from sync_lib.planner import (
     classify_file,
     detect_renames,
 )
+from sync_lib.scanner import scan_local
 from sync_lib.state import (
     StateManager,
     acquire_lock,
@@ -415,3 +416,62 @@ def test_cleanup_tmp_files(tmp_path):
     assert not (tmp_path / "file1.sync-tmp").exists()
     assert not (tmp_path / "file2.sync-tmp").exists()
     assert (tmp_path / "normal.txt").exists()
+
+
+# --- scanner: 本地文件扫描 ---
+
+
+def test_scanner_include_exclude(tmp_path):
+    # 创建测试文件
+    (tmp_path / "README.md").write_text("test")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("test")
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "artifacts" / "old.py").write_text("test")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("test")
+
+    config = {
+        "include": ["*.md", "src/**/*.py"],
+        "exclude": ["artifacts/", ".*/"],
+    }
+
+    snapshot = scan_local(tmp_path, config)
+    assert "README.md" in snapshot
+    assert "src/main.py" in snapshot
+    assert "artifacts/old.py" not in snapshot
+    assert ".git/config" not in snapshot
+
+
+def test_scanner_detect_format(tmp_path):
+    (tmp_path / "test.md").write_bytes(b"\xef\xbb\xbfline1\r\nline2\r\n")
+    config = {"include": ["*.md"], "exclude": []}
+    snapshot = scan_local(tmp_path, config)
+
+    entry = snapshot["test.md"]
+    assert entry["format"]["bom"] is True
+    assert entry["format"]["eol"] == "crlf"
+    assert entry["format"]["final_newline"] is True
+
+
+def test_scanner_skip_large_file(tmp_path):
+    large_content = "a" * (101 * 1024)  # 101 KB
+    (tmp_path / "large.md").write_text(large_content)
+    config = {"include": ["*.md"], "exclude": [], "max_chars": 100000}
+    snapshot = scan_local(tmp_path, config)
+
+    assert "large.md" not in snapshot
+    assert len(snapshot.skipped) == 1
+    assert snapshot.skipped[0]["path"] == "large.md"
+    assert snapshot.skipped[0]["reason"] == "max_chars_exceeded"
+
+
+def test_scanner_path_normalization(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("test")
+    config = {"include": ["docs/**/*.md"], "exclude": []}
+    snapshot = scan_local(tmp_path, config)
+
+    # 路径应该是 POSIX 格式
+    assert "docs/guide.md" in snapshot
+    assert "docs\\guide.md" not in snapshot
