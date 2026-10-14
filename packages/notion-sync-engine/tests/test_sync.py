@@ -652,3 +652,59 @@ def test_execute_push(tmp_path):
     remote.update_block.assert_called_once()
     state_mgr.set_pending.assert_called_once()
     state_mgr.clear_pending.assert_called_once()
+
+
+# --- remote: create_database（前置补充，Task 8） ---
+
+
+def test_create_database_returns_ids():
+    mock_client = Mock()
+    mock_client.databases.create.return_value = {
+        "id": "db123",
+        "data_sources": [{"id": "ds123", "name": "Notion Sync"}],
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    database_id, data_source_id = remote.create_database("page123")
+
+    assert database_id == "db123"
+    assert data_source_id == "ds123"
+    mock_client.databases.create.assert_called_once()
+    call_args = mock_client.databases.create.call_args[1]
+    assert call_args["parent"] == {"type": "page_id", "page_id": "page123"}
+    assert call_args["initial_data_source"]["properties"]["Name"]["title"] == {}
+
+
+def test_create_database_uses_rate_limiter():
+    mock_client = Mock()
+    mock_client.databases.create.return_value = {
+        "id": "db123",
+        "data_sources": [{"id": "ds123", "name": "Notion Sync"}],
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    remote.create_database("page123")
+
+    remote.limiter.wait.assert_called_once()
+
+
+# --- cli: 命令入口（Task 8） ---
+
+
+def test_cli_init(tmp_path, monkeypatch):
+    from sync_lib.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "test_token")
+
+    with patch("sync_lib.cli.NotionRemote") as mock_remote:
+        mock_remote.return_value.create_database.return_value = ("db123", "ds123")
+
+        with patch("sys.argv", ["sync.py", "init", "--parent-page-id", "page123"]):
+            main()
+
+        # 验证配置文件生成
+        assert (tmp_path / ".sync-config.yaml").exists()
+        assert (tmp_path / ".sync-state.json").exists()

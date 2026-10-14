@@ -131,6 +131,22 @@ class NotionRemote:
             lambda: self.client.blocks.update(block_id=block_id, code={"rich_text": rich_text}),
         )
 
+    def create_database(self, parent_page_id: str) -> tuple[str, str]:
+        """在指定 page 下创建同步数据库，返回 (database_id, data_source_id)"""
+        self.limiter.wait()
+
+        # notion_client 3.1.0 / API 2025-09-03：database 下挂 data_source，
+        # 属性需置于 initial_data_source.properties（顶层无 properties 参数）。
+        response = retry_with_backoff(lambda: self.client.databases.create(
+            parent={"type": "page_id", "page_id": parent_page_id},
+            title=[{"type": "text", "text": {"content": "Notion Sync"}}],
+            initial_data_source={"properties": {"Name": {"title": {}}}},
+        ))
+
+        database_id = response["id"]
+        data_source_id = response["data_sources"][0]["id"]
+        return database_id, data_source_id
+
     def _map_language(self, file_type):
         """映射文件类型到 Notion language"""
         mapping = {
