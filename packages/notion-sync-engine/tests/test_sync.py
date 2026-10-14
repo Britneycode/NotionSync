@@ -9,6 +9,12 @@ from sync_lib.canonical import (
     split_rich_text,
     validate_path,
 )
+from sync_lib.planner import (
+    Action,
+    classify_existence,
+    classify_file,
+    detect_renames,
+)
 
 
 def test_canonical_crlf_to_lf():
@@ -160,3 +166,137 @@ def test_normalize_path_posix_separators():
 def test_normalize_path_nfc():
     # NFD 的 "café" 规范化为 NFC
     assert normalize_path("café.txt") == "café.txt"
+
+
+# --- planner: 内容分类表（6.2 节） ---
+
+
+def test_classify_skip():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "a", "b", True, True).action == Action.SKIP
+
+
+def test_classify_push():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "c", "b", True, True).action == Action.PUSH
+
+
+def test_classify_pull():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "a", "c", True, True).action == Action.PULL
+
+
+def test_classify_baseline():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "c", "c", True, True).action == Action.BASELINE
+
+
+def test_classify_conflict():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "c", "d", True, True).action == Action.CONFLICT
+
+
+def test_classify_blocked_invalid_structure():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "synced"}
+    assert classify_file(state, "c", "b", True, False).action == Action.BLOCKED
+
+
+def test_classify_blocked_conflict_status():
+    state = {"base_local_hash": "a", "base_remote_hash": "b", "status": "conflict"}
+    assert classify_file(state, "c", "b", True, True).action == Action.BLOCKED
+
+
+# --- planner: 存在性分类表（6.3 节） ---
+
+
+def test_existence_create_remote():
+    # 状态无记录，本地存在，远端不存在
+    assert classify_existence(False, True, False, None, None).action == Action.CREATE_REMOTE
+
+
+def test_existence_adopt_same_content():
+    # 状态无记录，本地存在，远端按 Path 查到，内容相同
+    assert classify_existence(False, True, True, "a", "a").action == Action.ADOPT
+
+
+def test_existence_adopt_conflict():
+    # 状态无记录，本地存在，远端按 Path 查到，内容不同
+    assert classify_existence(False, True, True, "a", "b").action == Action.CONFLICT
+
+
+def test_existence_unmanaged():
+    # 状态无记录，本地不存在，远端存在
+    assert classify_existence(False, False, True, None, "b").action == Action.UNMANAGED
+
+
+def test_existence_archive_remote():
+    # 状态有记录，本地删除，远端存在且未改
+    assert classify_existence(True, False, True, None, "b", "b").action == Action.ARCHIVE_REMOTE
+
+
+def test_existence_conflict_local_deleted_remote_changed():
+    # 状态有记录，本地删除，远端改了
+    assert classify_existence(True, False, True, None, "c", "b").action == Action.CONFLICT
+
+
+def test_existence_delete_local():
+    # 状态有记录，本地存在，远端删除，本地未改
+    assert classify_existence(True, True, False, "a", None, None, "a").action == Action.DELETE_LOCAL
+
+
+def test_existence_conflict_remote_deleted_local_changed():
+    # 状态有记录，本地存在，远端删除，本地改了
+    assert classify_existence(True, True, False, "c", None, None, "a").action == Action.CONFLICT
+
+
+def test_existence_both_deleted():
+    # 状态有记录，本地删除，远端删除
+    assert classify_existence(True, False, False, None, None).action == Action.DELETE_STATE
+
+
+def test_existence_untracked():
+    # 状态有记录，本地不在范围内
+    assert classify_existence(True, "out-of-scope", True, None, "b").action == Action.UNTRACKED
+
+
+# --- planner: 重命名检测（6.4 节） ---
+
+
+def test_detect_renames_exact_match():
+    state = {"old.py": {"base_local_hash": "abc", "page_id": "123"}}
+    local_snapshot = {"new.py": {"hash": "abc"}}
+    renames = detect_renames(state, local_snapshot, set())
+    assert len(renames) == 1
+    assert renames[0].old_path == "old.py"
+    assert renames[0].new_path == "new.py"
+
+
+def test_detect_renames_case_only():
+    state = {"README.md": {"base_local_hash": "abc", "page_id": "123"}}
+    local_snapshot = {"readme.md": {"hash": "abc"}}
+    renames = detect_renames(state, local_snapshot, set())
+    assert len(renames) == 1
+    assert renames[0].old_path == "README.md"
+    assert renames[0].new_path == "readme.md"
+
+
+def test_detect_renames_no_match():
+    state = {"old.py": {"base_local_hash": "abc", "page_id": "123"}}
+    local_snapshot = {"new.py": {"hash": "xyz"}}
+    renames = detect_renames(state, local_snapshot, set())
+    assert len(renames) == 0
+
+
+def test_detect_renames_multiple_matches():
+    state = {"old.py": {"base_local_hash": "abc", "page_id": "123"}}
+    local_snapshot = {"new1.py": {"hash": "abc"}, "new2.py": {"hash": "abc"}}
+    renames = detect_renames(state, local_snapshot, set())
+    assert len(renames) == 0  # 多个匹配时不重命名
+
+
+def test_detect_renames_remote_changed():
+    state = {"old.py": {"base_local_hash": "abc", "page_id": "123"}}
+    local_snapshot = {"new.py": {"hash": "abc"}}
+    remote_changed = {"old.py"}  # 远端已修改
+    renames = detect_renames(state, local_snapshot, remote_changed)
+    assert len(renames) == 0  # 远端修改时不重命名
