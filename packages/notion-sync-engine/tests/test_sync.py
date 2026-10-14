@@ -703,6 +703,27 @@ def test_create_database_uses_rate_limiter():
     remote.limiter.wait.assert_called_once()
 
 
+def test_create_database_declares_all_five_properties():
+    mock_client = Mock()
+    mock_client.databases.create.return_value = {
+        "id": "db123",
+        "data_sources": [{"id": "ds123", "name": "Notion Sync"}],
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.create_database("page123")
+
+    props = mock_client.databases.create.call_args[1]["initial_data_source"]["properties"]
+    assert set(props) == {"Name", "Path", "Type", "Directory", "Chars"}
+    assert props["Name"] == {"title": {}}
+    assert props["Path"] == {"rich_text": {}}
+    assert props["Directory"] == {"rich_text": {}}
+    assert props["Chars"] == {"number": {}}
+    assert set(props["Type"]) == {"select"}
+    option_names = [opt["name"] for opt in props["Type"]["select"]["options"]]
+    assert set(option_names) == {"markdown", "python", "yaml", "toml", "text"}
+
+
 # --- cli: 命令入口（Task 8） ---
 
 

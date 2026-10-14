@@ -223,7 +223,15 @@ class NotionRemote:
         response = retry_with_backoff(lambda: self.client.databases.create(
             parent={"type": "page_id", "page_id": parent_page_id},
             title=[{"type": "text", "text": {"content": "Notion Sync"}}],
-            initial_data_source={"properties": {"Name": {"title": {}}}},
+            initial_data_source={"properties": {
+                "Name": {"title": {}},
+                "Path": {"rich_text": {}},
+                "Type": {"select": {"options": [
+                    {"name": n} for n in ("markdown", "python", "yaml", "toml", "text")
+                ]}},
+                "Directory": {"rich_text": {}},
+                "Chars": {"number": {}},
+            }},
         ))
 
         database_id = response["id"]
