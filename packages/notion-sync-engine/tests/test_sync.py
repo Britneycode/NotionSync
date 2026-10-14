@@ -720,3 +720,200 @@ def test_cli_init(tmp_path, monkeypatch):
         # 验证配置文件生成
         assert (tmp_path / ".sync-config.yaml").exists()
         assert (tmp_path / ".sync-state.json").exists()
+
+
+# --- remote: 远端读取（cmd_sync 主线 Task A） ---
+
+
+def _page(page_id, path, last_edited="2026-10-14T10:00:00Z", in_trash=False):
+    """构造 data_sources.query 返回的 page 对象"""
+    props = {"Path": {"rich_text": [{"plain_text": path}]}} if path is not None else {}
+    return {
+        "id": page_id,
+        "last_edited_time": last_edited,
+        "in_trash": in_trash,
+        "properties": props,
+    }
+
+
+def test_query_candidates_paginates_and_extracts_fields():
+    mock_client = Mock()
+    mock_client.data_sources.query.side_effect = [
+        {
+            "results": [
+                _page("p1", "a.md"),
+                _page("p2", "b/c.py", in_trash=True),
+            ],
+            "has_more": True,
+            "next_cursor": "cursor1",
+        },
+        {
+            "results": [_page("p3", "d.md")],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    ]
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    result = remote.query_candidates(None)
+
+    assert result == [
+        {"id": "p1", "path": "a.md",
+         "last_edited_time": "2026-10-14T10:00:00Z", "in_trash": False},
+        {"id": "p2", "path": "b/c.py",
+         "last_edited_time": "2026-10-14T10:00:00Z", "in_trash": True},
+        {"id": "p3", "path": "d.md",
+         "last_edited_time": "2026-10-14T10:00:00Z", "in_trash": False},
+    ]
+    assert mock_client.data_sources.query.call_count == 2
+    # 第一页无 cursor，第二页带上 next_cursor
+    first_call = mock_client.data_sources.query.call_args_list[0][1]
+    second_call = mock_client.data_sources.query.call_args_list[1][1]
+    assert "start_cursor" not in first_call
+    assert second_call["start_cursor"] == "cursor1"
+    # 每页都走限流
+    assert remote.limiter.wait.call_count == 2
+
+
+def test_query_candidates_with_since_adds_filter():
+    mock_client = Mock()
+    mock_client.data_sources.query.return_value = {
+        "results": [_page("p1", "a.md")],
+        "has_more": False,
+        "next_cursor": None,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    remote.query_candidates("2026-10-01T00:00:00Z")
+
+    call_args = mock_client.data_sources.query.call_args[1]
+    assert call_args["filter"] == {
+        "timestamp": "last_edited_time",
+        "last_edited_time": {"on_or_after": "2026-10-01T00:00:00Z"},
+    }
+
+
+def test_query_candidates_missing_path_is_none():
+    mock_client = Mock()
+    mock_client.data_sources.query.return_value = {
+        "results": [_page("p1", None)],
+        "has_more": False,
+        "next_cursor": None,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    result = remote.query_candidates(None)
+
+    assert result[0]["path"] is None
+
+
+def test_query_candidates_uses_retry_and_data_source_id():
+    mock_client = Mock()
+    mock_client.data_sources.query.return_value = {
+        "results": [],
+        "has_more": False,
+        "next_cursor": None,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    with patch("sync_lib.remote.retry_with_backoff", side_effect=lambda f: f()) as mock_retry:
+        remote.query_candidates(None)
+
+    assert mock_retry.call_count == 1
+    assert mock_client.data_sources.query.call_args[0][0] == "ds123"
+
+
+def test_query_by_paths_returns_hits_only():
+    mock_client = Mock()
+
+    def query(data_source_id, **kwargs):
+        path = kwargs["filter"]["rich_text"]["equals"]
+        if path == "a.md":
+            return {"results": [_page("p1", "a.md")], "has_more": False}
+        return {"results": [], "has_more": False}
+
+    mock_client.data_sources.query.side_effect = query
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    result = remote.query_by_paths(["a.md", "missing.md"])
+
+    assert result == {"a.md": "p1"}
+    assert "missing.md" not in result
+    # 逐个走限流
+    assert remote.limiter.wait.call_count == 2
+    # filter 体按 Path 精确匹配
+    first_call = mock_client.data_sources.query.call_args_list[0][1]
+    assert first_call["filter"] == {"property": "Path", "rich_text": {"equals": "a.md"}}
+
+
+def test_archive_page_sets_in_trash():
+    mock_client = Mock()
+    mock_client.pages.update.return_value = {"id": "p1", "in_trash": True}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    remote.archive_page("p1")
+
+    mock_client.pages.update.assert_called_once_with(page_id="p1", in_trash=True)
+    assert remote.limiter.wait.call_count == 1
+
+
+def test_read_page_collects_all_pages():
+    mock_client = Mock()
+    mock_client.blocks.children.list.side_effect = [
+        {
+            "results": [],
+            "has_more": True,
+            "next_cursor": "cursor1",
+        },
+        {
+            "results": [{
+                "id": "block123",
+                "type": "code",
+                "code": {"rich_text": [{"plain_text": "line1\n"}, {"plain_text": "line2"}]},
+            }],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    ]
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    content, block_id, struct_valid = remote.read_page("page123")
+
+    assert content == "line1\nline2"
+    assert block_id == "block123"
+    assert struct_valid is True
+    assert mock_client.blocks.children.list.call_count == 2
+    second_call = mock_client.blocks.children.list.call_args_list[1][1]
+    assert second_call["start_cursor"] == "cursor1"
+
+
+def test_read_page_multi_page_invalid_structure():
+    # 第二页多出一个非 code block → 结构校验失败
+    mock_client = Mock()
+    mock_client.blocks.children.list.side_effect = [
+        {"results": [{"id": "b1", "type": "code", "code": {"rich_text": []}}],
+         "has_more": True, "next_cursor": "c1"},
+        {"results": [{"id": "b2", "type": "paragraph", "paragraph": {"rich_text": []}}],
+         "has_more": False, "next_cursor": None},
+    ]
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.limiter.wait = Mock()
+
+    content, block_id, struct_valid = remote.read_page("page123")
+
+    assert struct_valid is False

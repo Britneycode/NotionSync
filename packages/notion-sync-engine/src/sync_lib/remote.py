@@ -99,16 +99,92 @@ class NotionRemote:
         ))
         return response["id"]
 
-    def read_page(self, page_id):
-        """读取页面正文"""
-        self.limiter.wait()
+    def query_candidates(self, since_iso):
+        """分页拉取 data source 下全部页面，返回候选列表。
 
-        response = retry_with_backoff(lambda: self.client.blocks.children.list(
-            block_id=page_id,
-            page_size=100,
+        since_iso 非 None 时按 last_edited_time 过滤（含边界）。
+        返回每页 {"id", "path", "last_edited_time", "in_trash"}。
+        """
+        results = []
+        start_cursor = None
+        while True:
+            self.limiter.wait()
+            body = {}
+            if since_iso is not None:
+                body["filter"] = {
+                    "timestamp": "last_edited_time",
+                    "last_edited_time": {"on_or_after": since_iso},
+                }
+            if start_cursor is not None:
+                body["start_cursor"] = start_cursor
+
+            response = retry_with_backoff(lambda: self.client.data_sources.query(
+                self.data_source_id, **body,
+            ))
+
+            for page in response["results"]:
+                results.append({
+                    "id": page["id"],
+                    "path": self._extract_path(page),
+                    "last_edited_time": page.get("last_edited_time"),
+                    "in_trash": page.get("in_trash", False),
+                })
+
+            if not response.get("has_more"):
+                break
+            start_cursor = response.get("next_cursor")
+
+        return results
+
+    def query_by_paths(self, paths):
+        """按 Path 精确查 page_id，返回 {path: page_id}，未命中不含该键。"""
+        mapping = {}
+        for path in paths:
+            self.limiter.wait()
+            response = retry_with_backoff(lambda: self.client.data_sources.query(
+                self.data_source_id,
+                filter={"property": "Path", "rich_text": {"equals": path}},
+            ))
+            results = response["results"]
+            if results:
+                mapping[path] = results[0]["id"]
+        return mapping
+
+    def archive_page(self, page_id):
+        """归档页面（移入回收站）"""
+        self.limiter.wait()
+        return retry_with_backoff(lambda: self.client.pages.update(
+            page_id=page_id, in_trash=True,
         ))
 
-        blocks = response["results"]
+    @staticmethod
+    def _extract_path(page):
+        """取 page.properties["Path"] 首个 rich_text 的 plain_text，缺失/空 → None"""
+        rich_text = page.get("properties", {}).get("Path", {}).get("rich_text", [])
+        if not rich_text:
+            return None
+        plain = rich_text[0].get("plain_text")
+        return plain if plain else None
+
+    def read_page(self, page_id):
+        """读取页面正文（分页拉全 children 后做结构校验）"""
+        blocks = []
+        start_cursor = None
+        while True:
+            self.limiter.wait()
+            kwargs = {"block_id": page_id, "page_size": 100}
+            if start_cursor is not None:
+                kwargs["start_cursor"] = start_cursor
+
+            response = retry_with_backoff(
+                lambda: self.client.blocks.children.list(**kwargs),
+            )
+            blocks.extend(response["results"])
+
+            if not response.get("has_more"):
+                break
+            start_cursor = response.get("next_cursor")
+
         code_blocks = [b for b in blocks if b["type"] == "code"]
 
         # 结构校验
