@@ -3,6 +3,10 @@ detection/restoration, rich_text splitting and path validation)."""
 
 import json
 import os
+import time
+from unittest.mock import Mock, patch
+
+import pytest
 
 from sync_lib.canonical import (
     canonical,
@@ -18,6 +22,7 @@ from sync_lib.planner import (
     classify_file,
     detect_renames,
 )
+from sync_lib.remote import NotionRemote, RateLimiter, retry_with_backoff
 from sync_lib.scanner import scan_local
 from sync_lib.state import (
     StateManager,
@@ -475,3 +480,122 @@ def test_scanner_path_normalization(tmp_path):
     # 路径应该是 POSIX 格式
     assert "docs/guide.md" in snapshot
     assert "docs\\guide.md" not in snapshot
+
+
+# --- remote: 令牌桶限流器 ---
+
+
+def test_rate_limiter_basic():
+    limiter = RateLimiter(rate=2.5)  # 2.5 req/s
+    start = time.time()
+    for _ in range(3):
+        limiter.wait()
+    elapsed = time.time() - start
+    # 3 个请求至少需要 (3-1) / 2.5 = 0.8 秒
+    assert elapsed >= 0.8
+
+
+def test_rate_limiter_burst():
+    limiter = RateLimiter(rate=10.0, burst=3)
+    start = time.time()
+    for _ in range(3):
+        limiter.wait()
+    elapsed = time.time() - start
+    # 突发 3 个应该立即完成
+    assert elapsed < 0.1
+
+
+# --- remote: 指数退避重试 ---
+
+
+def test_retry_success_first_try():
+    func = Mock(return_value="success")
+    result = retry_with_backoff(func, max_retries=3)
+    assert result == "success"
+    assert func.call_count == 1
+
+
+def test_retry_success_after_failure():
+    func = Mock(side_effect=[Exception("fail"), Exception("fail"), "success"])
+    result = retry_with_backoff(func, max_retries=3)
+    assert result == "success"
+    assert func.call_count == 3
+
+
+def test_retry_exhausted():
+    func = Mock(side_effect=Exception("fail"))
+    with pytest.raises(Exception):
+        retry_with_backoff(func, max_retries=2)
+    assert func.call_count == 2
+
+
+def test_retry_respects_retry_after():
+    # 内置 Exception 不接受关键字参数，先构造再挂 headers 属性
+    err = Exception("429")
+    err.headers = {"Retry-After": "2"}
+    func = Mock(side_effect=[err, "success"])
+    with patch("time.sleep") as mock_sleep:
+        result = retry_with_backoff(func, max_retries=2)
+        assert result == "success"
+        mock_sleep.assert_called_with(2)
+
+
+# --- remote: code block 读写（mock Notion API） ---
+
+
+def test_create_page_with_code_block():
+    mock_client = Mock()
+    mock_client.pages.create.return_value = {"id": "page123"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    page_id = remote.create_page(
+        path="test.md",
+        content="# Hello",
+        file_type="markdown",
+        directory="",
+        chars=7,
+    )
+
+    assert page_id == "page123"
+    mock_client.pages.create.assert_called_once()
+    call_args = mock_client.pages.create.call_args[1]
+    assert call_args["parent"]["data_source_id"] == "ds123"
+    assert call_args["properties"]["Name"]["title"][0]["text"]["content"] == "test.md"
+
+
+def test_read_page_single_code_block():
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [{
+            "id": "block123",
+            "type": "code",
+            "code": {
+                "rich_text": [{"plain_text": "line1\n"}, {"plain_text": "line2"}],
+                "language": "markdown",
+            },
+        }],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content, block_id, struct_valid = remote.read_page("page123")
+
+    assert content == "line1\nline2"
+    assert block_id == "block123"
+    assert struct_valid is True
+
+
+def test_read_page_invalid_structure_multiple_blocks():
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [
+            {"id": "block1", "type": "code", "code": {"rich_text": []}},
+            {"id": "block2", "type": "code", "code": {"rich_text": []}},
+        ],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content, block_id, struct_valid = remote.read_page("page123")
+
+    assert struct_valid is False
