@@ -485,6 +485,18 @@ def test_scanner_path_normalization(tmp_path):
     assert "docs\\guide.md" not in snapshot
 
 
+def test_scanner_path_nfc_normalization(tmp_path):
+    # NFD 组合文件名（e + U+0301）
+    nfd_name = "café.md"
+    (tmp_path / nfd_name).write_text("test")
+    config = {"include": ["*.md"], "exclude": []}
+    snapshot = scan_local(tmp_path, config)
+
+    # 快照键应经 normalize_path 规范化为 NFC 形式
+    assert "café.md" in snapshot
+    assert nfd_name not in snapshot
+
+
 # --- remote: 令牌桶限流器 ---
 
 

@@ -1,8 +1,10 @@
 # sync_lib/scanner.py
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
+
 import pathspec
-from .canonical import detect_format, compute_hash, validate_path, canonical
+
+from .canonical import canonical, compute_hash, detect_format, normalize_path, validate_path
 
 
 @dataclass
@@ -41,8 +43,8 @@ def scan_local(root: Path, config: dict) -> LocalSnapshot:
         if not file_path.is_file():
             continue
 
-        # 相对路径（POSIX 格式）
-        rel_path = file_path.relative_to(root).as_posix()
+        # 相对路径（POSIX 格式，NFC 规范化）
+        rel_path = normalize_path(file_path.relative_to(root).as_posix())
 
         # 检查内置排除
         if builtin_exclude.match_file(rel_path):
