@@ -1,4 +1,6 @@
 import hashlib
+import unicodedata
+from pathlib import PurePosixPath
 
 
 def canonical(text: str) -> str:
@@ -91,8 +93,23 @@ def split_rich_text(text: str, max_units: int = 2000) -> list[str]:
     return chunks
 
 
+def normalize_path(path: str) -> str:
+    """把路径统一为 NFC 规范化的 POSIX 形式。
+
+    - 反斜杠分隔符统一为正斜杠（Windows → POSIX）
+    - NFC 规范化，避免 NFC/NFD 等价文件名映射到不同 state key
+    - 合并重复分隔符、去除 `.` 段（PurePosixPath 语义）
+    """
+    path = path.replace("\\", "/")
+    path = unicodedata.normalize("NFC", path)
+    return str(PurePosixPath(path))
+
+
 def validate_path(path: str) -> bool:
     """校验路径安全性"""
+    # 统一为 NFC 规范化的 POSIX 形式（拒绝反斜杠穿越等绕过手法）
+    path = normalize_path(path)
+
     # 拒绝绝对路径
     if path.startswith("/") or (len(path) >= 2 and path[1] == ":"):
         return False

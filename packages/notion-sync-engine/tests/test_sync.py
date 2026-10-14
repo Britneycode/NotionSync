@@ -4,6 +4,7 @@ detection/restoration, rich_text splitting and path validation)."""
 from sync_lib.canonical import (
     canonical,
     detect_format,
+    normalize_path,
     restore_format,
     split_rich_text,
     validate_path,
@@ -132,3 +133,30 @@ def test_validate_path_reject_trailing_space():
 def test_validate_path_reject_trailing_dot():
     assert validate_path("file.txt.") is False
     assert validate_path("dir./file.txt") is False
+
+
+def test_validate_path_reject_backslash_parent():
+    assert validate_path("..\\..\\etc\\passwd") is False
+
+
+def test_validate_path_reject_backslash_parent_mixed():
+    assert validate_path("..\\etc/passwd") is False
+
+
+def test_validate_path_normal_backslash():
+    assert validate_path("src\\main.py") is True
+
+
+def test_validate_path_nfc_nfd_consistent():
+    # NFC 与 NFD 形式的同一路径都应被接受
+    assert validate_path("café/notes.txt") is True
+    assert validate_path("café/notes.txt") is True
+
+
+def test_normalize_path_posix_separators():
+    assert normalize_path("docs\\reports\\final.md") == "docs/reports/final.md"
+
+
+def test_normalize_path_nfc():
+    # NFD 的 "café" 规范化为 NFC
+    assert normalize_path("café.txt") == "café.txt"
