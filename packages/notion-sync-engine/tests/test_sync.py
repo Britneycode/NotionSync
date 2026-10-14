@@ -18,6 +18,7 @@ from sync_lib.canonical import (
     validate_path,
 )
 from sync_lib.executor import _br_from_update_response, execute_plan
+from sync_lib.plan import build_plan
 from sync_lib.planner import (
     Action,
     Classification,
@@ -26,7 +27,7 @@ from sync_lib.planner import (
     detect_renames,
 )
 from sync_lib.remote import NotionRemote, RateLimiter, retry_with_backoff
-from sync_lib.scanner import scan_local
+from sync_lib.scanner import LocalSnapshot, scan_local
 from sync_lib.state import (
     StateManager,
     acquire_lock,
@@ -1298,3 +1299,210 @@ def test_execute_conflict_backs_up_remote(tmp_path):
     assert len(backups) == 1
     assert backups[0].read_text() == "remote version"
     assert mgr.get_file("a.md")["status"] == "conflict"
+
+
+# --- plan: build_plan 三方合并（6.1 步骤 5） ---
+
+
+def _snapshot(files):
+    """用 {path: hash} 构造 LocalSnapshot。"""
+    return LocalSnapshot(
+        files={path: {"hash": h, "format": {}, "size_kb": 0.0} for path, h in files.items()}
+    )
+
+
+def _state_entry(page_id="p1", base_local="a", base_remote="b", status="synced"):
+    return {
+        "page_id": page_id,
+        "block_id": "b1",
+        "base_local_hash": base_local,
+        "base_remote_hash": base_remote,
+        "format": {},
+        "status": status,
+    }
+
+
+def _remote_entry(page_id="p1", hash="b", struct_valid=True):
+    return {
+        "page_id": page_id,
+        "hash": hash,
+        "last_edited_time": "2026-01-01T00:00:00.000Z",
+        "struct_valid": struct_valid,
+    }
+
+
+# 6.2 内容分类表（两端都存在的已跟踪文件）
+PLAN_62_CASES = [
+    # name, local_hash, remote_hash, struct_valid, status, expected
+    ("skip", "a", "b", True, "synced", Action.SKIP),
+    ("push", "c", "b", True, "synced", Action.PUSH),
+    ("pull", "a", "c", True, "synced", Action.PULL),
+    ("baseline", "c", "c", True, "synced", Action.BASELINE),
+    ("conflict", "c", "d", True, "synced", Action.CONFLICT),
+    ("blocked_invalid_structure", "c", "b", False, "synced", Action.BLOCKED),
+    ("blocked_conflict_status", "c", "b", True, "conflict", Action.BLOCKED),
+]
+
+
+@pytest.mark.parametrize(
+    "name,local_hash,remote_hash,struct_valid,status,expected", PLAN_62_CASES
+)
+def test_build_plan_62_content_table(name, local_hash, remote_hash, struct_valid, status, expected):
+    plan = build_plan(
+        _snapshot({"a.md": local_hash}),
+        {"a.md": _remote_entry(hash=remote_hash, struct_valid=struct_valid)},
+        {"a.md": _state_entry(base_local="a", base_remote="b", status=status)},
+        {},
+    )
+    assert plan["a.md"].action == expected
+
+
+# 6.3 存在性分类表（删除与新增）
+PLAN_63_CASES = [
+    # name, path, local_files, remote_index, state_files, config, expected
+    ("create_remote", "new.md", {"new.md": "h"}, {}, {}, {}, Action.CREATE_REMOTE),
+    (
+        "adopt_same",
+        "a.md",
+        {"a.md": "h"},
+        {"a.md": _remote_entry(page_id="p9", hash="h")},
+        {},
+        {},
+        Action.ADOPT,
+    ),
+    (
+        "adopt_conflict",
+        "a.md",
+        {"a.md": "h1"},
+        {"a.md": _remote_entry(hash="h2")},
+        {},
+        {},
+        Action.CONFLICT,
+    ),
+    ("unmanaged", "x.md", {}, {"x.md": _remote_entry()}, {}, {}, Action.UNMANAGED),
+    (
+        "archive_remote",
+        "a.md",
+        {},
+        {"a.md": _remote_entry(hash="b")},
+        {"a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+        Action.ARCHIVE_REMOTE,
+    ),
+    (
+        "conflict_local_deleted_remote_changed",
+        "a.md",
+        {},
+        {"a.md": _remote_entry(hash="c")},
+        {"a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+        Action.CONFLICT,
+    ),
+    (
+        "delete_local",
+        "a.md",
+        {"a.md": "a"},
+        {},
+        {"a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+        Action.DELETE_LOCAL,
+    ),
+    (
+        "conflict_remote_deleted_local_changed",
+        "a.md",
+        {"a.md": "c"},
+        {},
+        {"a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+        Action.CONFLICT,
+    ),
+    ("delete_state", "a.md", {}, {}, {"a.md": _state_entry()}, {}, Action.DELETE_STATE),
+    (
+        "untracked",
+        "secrets/x.md",
+        {},
+        {},
+        {"secrets/x.md": _state_entry()},
+        {"exclude": ["secrets/**"]},
+        Action.UNTRACKED,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,path,local_files,remote_index,state_files,config,expected", PLAN_63_CASES
+)
+def test_build_plan_63_existence_table(
+    name, path, local_files, remote_index, state_files, config, expected
+):
+    plan = build_plan(_snapshot(local_files), remote_index, state_files, config)
+    assert plan[path].action == expected
+
+
+def test_build_plan_adopt_carries_page_id():
+    plan = build_plan(
+        _snapshot({"a.md": "same"}),
+        {"a.md": _remote_entry(page_id="p42", hash="same")},
+        {},
+        {},
+    )
+    assert plan["a.md"].action == Action.ADOPT
+    assert plan["a.md"].meta == {"page_id": "p42"}
+
+
+def test_build_plan_rename_exact():
+    plan = build_plan(
+        _snapshot({"new.md": "abc"}),
+        {},
+        {"old.md": _state_entry(page_id="p7", base_local="abc", base_remote="abc")},
+        {},
+    )
+    assert plan["old.md"].action == Action.RENAME
+    assert plan["old.md"].meta == {"new_path": "new.md", "page_id": "p7"}
+    assert "new.md" not in plan  # 目标路径已从待分类集合移除
+
+
+def test_build_plan_rename_case_only():
+    plan = build_plan(
+        _snapshot({"readme.md": "abc"}),
+        {},
+        {"README.md": _state_entry(page_id="p7", base_local="abc", base_remote="abc")},
+        {},
+    )
+    assert plan["README.md"].action == Action.RENAME
+    assert plan["README.md"].meta["new_path"] == "readme.md"
+
+
+def test_build_plan_rename_skipped_when_remote_changed():
+    plan = build_plan(
+        _snapshot({"new.md": "abc"}),
+        {"old.md": _remote_entry(hash="changed")},
+        {"old.md": _state_entry(page_id="p7", base_local="abc", base_remote="abc")},
+        {},
+    )
+    # 远端已改 → 不判重命名；old.md 走存在性分类（本地消失、远端改了）→ CONFLICT
+    assert plan["old.md"].action == Action.CONFLICT
+    assert plan["new.md"].action == Action.CREATE_REMOTE
+
+
+def test_build_plan_normalizes_keys():
+    plan = build_plan(
+        _snapshot({"sub\\a.md": "a"}),
+        {"sub\\a.md": _remote_entry(hash="b")},
+        {"sub\\a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+    )
+    assert "sub/a.md" in plan
+    assert plan["sub/a.md"].action == Action.SKIP
+
+
+def test_build_plan_trashed_remote_treated_as_absent():
+    plan = build_plan(
+        _snapshot({"a.md": "a"}),
+        {"a.md": _remote_entry(hash="b")},
+        {"a.md": _state_entry(base_local="a", base_remote="b")},
+        {},
+        remote_paths_trashed={"a.md"},
+    )
+    # 远端在回收站 → 视为远端不存在：本地未改 → DELETE_LOCAL
+    assert plan["a.md"].action == Action.DELETE_LOCAL
