@@ -1230,9 +1230,33 @@ def test_execute_rename(tmp_path):
     assert summary.renamed == 1
     args = remote.update_page_properties.call_args[0]
     assert args[0] == "p1"
-    assert args[1] == {"Name": "src/new.py", "Path": "src/new.py", "Directory": "src"}
+    assert args[1] == {
+        "Name": {"title": [{"text": {"content": "src/new.py"}}]},
+        "Path": {"rich_text": [{"text": {"content": "src/new.py"}}]},
+        "Directory": {"rich_text": [{"text": {"content": "src"}}]},
+    }
     assert "old.py" not in mgr.state["files"]
     assert mgr.state["files"]["src/new.py"]["page_id"] == "p1"
+
+
+def test_execute_rename_wraps_properties_in_notion_shapes(tmp_path):
+    """RENAME 传给 update_page_properties 的属性必须是 Notion 包装形状
+    （Name=title、Path/Directory=rich_text），而非裸字符串。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("old.py", {"page_id": "p1", "base_local_hash": "h"})
+
+    remote = Mock()
+    remote.update_page_properties.return_value = {"id": "p1"}
+
+    plan = {"old.py": Classification(
+        Action.RENAME, meta={"new_path": "src/new.py", "page_id": "p1"})}
+    execute_plan(plan, mgr, remote, tmp_path, {})
+
+    properties = remote.update_page_properties.call_args[0][1]
+    assert properties["Name"]["title"][0]["text"]["content"] == "src/new.py"
+    assert properties["Path"]["rich_text"][0]["text"]["content"] == "src/new.py"
+    assert properties["Directory"]["rich_text"][0]["text"]["content"] == "src"
 
 
 def test_execute_baseline(tmp_path):

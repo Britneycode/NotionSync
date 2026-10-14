@@ -258,11 +258,12 @@ def _execute_delete_local(path, state_mgr, local_root):
 def _execute_rename(rename, state_mgr, remote, local_root, config):
     """执行 RENAME：更新远端属性，状态键 old → new"""
     directory = _directory_from_path(rename.new_path)
-    remote.update_page_properties(rename.page_id, {
-        "Name": rename.new_path,
-        "Path": rename.new_path,
-        "Directory": directory,
-    })
+    properties = {
+        "Name": {"title": [{"text": {"content": rename.new_path}}]},
+        "Path": {"rich_text": [{"text": {"content": rename.new_path}}]},
+        "Directory": {"rich_text": [{"text": {"content": directory}}]},
+    }
+    remote.update_page_properties(rename.page_id, properties)
 
     files = state_mgr.state["files"]
     files[rename.new_path] = files.pop(rename.old_path)
