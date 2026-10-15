@@ -30,12 +30,15 @@ def _rich_text(text: str) -> list[dict]:
 
 class RateLimiter:
     """令牌桶限流器"""
-    def __init__(self, rate: float, burst: int = 1):
+    def __init__(self, rate: float, burst: int = 1, waiter=None):
         self.rate = rate  # 每秒令牌数
         self.burst = burst  # 桶容量
         self.tokens = burst
         self.last_update = time.time()
         self.lock = Lock()
+        # 等待函数可注入：同步流程传 CancelToken.sleep，等待期间可被取消。
+        # 传 None 时在构造处解析 time.sleep，这样 `patch("time.sleep")` 仍然生效。
+        self.waiter = waiter or time.sleep
 
     def wait(self):
         """等待直到有可用令牌"""
@@ -52,11 +55,13 @@ class RateLimiter:
 
                 # 等待到下一个令牌
                 sleep_time = (1 - self.tokens) / self.rate
-                time.sleep(sleep_time)
+                self.waiter(sleep_time)
 
 
-def retry_with_backoff(func, max_retries=6, base_delay=1.0):
+def retry_with_backoff(func, max_retries=6, base_delay=1.0, waiter=None):
     """指数退避重试"""
+    # 同上：在调用处解析 time.sleep，保证 `patch("time.sleep")` 依然拦得住
+    waiter = waiter or time.sleep
     for attempt in range(max_retries):
         try:
             return func()
@@ -78,17 +83,23 @@ def retry_with_backoff(func, max_retries=6, base_delay=1.0):
             else:
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
 
-            time.sleep(delay)
+            waiter(delay)
 
     raise Exception("Max retries exceeded")
 
 
 class NotionRemote:
-    def __init__(self, client: Client, database_id: str, data_source_id: str):
+    def __init__(self, client: Client, database_id: str, data_source_id: str, cancel=None):
         self.client = client
         self.database_id = database_id
         self.data_source_id = data_source_id
-        self.limiter = RateLimiter(rate=2.5)
+        # cancel 传入 CancelToken 时，限流与退避的等待都能被立刻打断
+        self._waiter = cancel.sleep if cancel is not None else None
+        self.limiter = RateLimiter(rate=2.5, waiter=self._waiter)
+
+    def _retry(self, func, **kwargs):
+        """retry_with_backoff 的实例包装：统一带上可取消的等待函数。"""
+        return retry_with_backoff(func, waiter=self._waiter, **kwargs)
 
     def _code_block(self, text: str, language: str) -> dict:
         """构造 code block（正文超出单块容量时由调用方拆成多个）"""
@@ -108,7 +119,7 @@ class NotionRemote:
         language = self._map_language(file_type)
         children = [self._code_block(chunk, language) for chunk in split_into_blocks(content)]
 
-        response = retry_with_backoff(lambda: self.client.pages.create(
+        response = self._retry(lambda: self.client.pages.create(
             parent={"data_source_id": self.data_source_id},
             properties={
                 "Name": {"title": [{"text": {"content": path}}]},
@@ -140,7 +151,7 @@ class NotionRemote:
             if start_cursor is not None:
                 body["start_cursor"] = start_cursor
 
-            response = retry_with_backoff(lambda: self.client.data_sources.query(
+            response = self._retry(lambda: self.client.data_sources.query(
                 self.data_source_id, **body,
             ))
 
@@ -163,7 +174,7 @@ class NotionRemote:
         mapping = {}
         for path in paths:
             self.limiter.wait()
-            response = retry_with_backoff(lambda: self.client.data_sources.query(
+            response = self._retry(lambda: self.client.data_sources.query(
                 self.data_source_id,
                 filter={"property": "Path", "rich_text": {"equals": path}},
             ))
@@ -175,14 +186,14 @@ class NotionRemote:
     def archive_page(self, page_id):
         """归档页面（移入回收站）"""
         self.limiter.wait()
-        return retry_with_backoff(lambda: self.client.pages.update(
+        return self._retry(lambda: self.client.pages.update(
             page_id=page_id, in_trash=True,
         ))
 
     def update_page_properties(self, page_id, properties):
         """更新页面属性（RENAME 用：Name / Path / Directory）"""
         self.limiter.wait()
-        return retry_with_backoff(lambda: self.client.pages.update(
+        return self._retry(lambda: self.client.pages.update(
             page_id=page_id, properties=properties,
         ))
 
@@ -205,7 +216,7 @@ class NotionRemote:
             if start_cursor is not None:
                 kwargs["start_cursor"] = start_cursor
 
-            response = retry_with_backoff(
+            response = self._retry(
                 lambda: self.client.blocks.children.list(**kwargs),
             )
             blocks.extend(response["results"])
@@ -237,7 +248,7 @@ class NotionRemote:
         """替换单个 code block 的全部 rich_text 内容（按 UTF-16 码元切分，≤2000/段）"""
         self.limiter.wait()
         rich_text = _rich_text(content)
-        return retry_with_backoff(
+        return self._retry(
             lambda: self.client.blocks.update(block_id=block_id, code={"rich_text": rich_text}),
         )
 
@@ -272,7 +283,7 @@ class NotionRemote:
     def _append_code_block(self, page_id: str, text: str, language: str) -> dict:
         """在页面末尾追加一个 code block"""
         self.limiter.wait()
-        return retry_with_backoff(lambda: self.client.blocks.children.append(
+        return self._retry(lambda: self.client.blocks.children.append(
             block_id=page_id,
             children=[self._code_block(text, language)],
         ))
@@ -280,7 +291,7 @@ class NotionRemote:
     def _delete_block(self, block_id: str) -> dict:
         """删除子块（正文变短时清理多余的 code block）"""
         self.limiter.wait()
-        return retry_with_backoff(lambda: self.client.blocks.delete(block_id=block_id))
+        return self._retry(lambda: self.client.blocks.delete(block_id=block_id))
 
     def create_database(self, parent_page_id: str) -> tuple[str, str]:
         """在指定 page 下创建同步数据库，返回 (database_id, data_source_id)"""
@@ -288,7 +299,7 @@ class NotionRemote:
 
         # notion_client 3.1.0 / API 2025-09-03：database 下挂 data_source，
         # 属性需置于 initial_data_source.properties（顶层无 properties 参数）。
-        response = retry_with_backoff(lambda: self.client.databases.create(
+        response = self._retry(lambda: self.client.databases.create(
             parent={"type": "page_id", "page_id": parent_page_id},
             title=[{"type": "text", "text": {"content": "Notion Sync"}}],
             initial_data_source={"properties": {

@@ -1,12 +1,12 @@
-"""Notion 双向同步的状态管理：原子读写 .sync-state.json、pending 意图日志、
-崩溃恢复与进程锁（.sync.lock）。"""
+"""Notion 双向同步的状态管理：原子读写 .sync-state.json、pending 意图日志、崩溃恢复。
+
+运行锁已迁到 `lock.py`（内核文件锁），本模块不再管锁。
+"""
 
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-
-import psutil
 
 
 class StateManager:
@@ -14,7 +14,6 @@ class StateManager:
         self.root = Path(root)
         self.state_file = self.root / ".sync-state.json"
         self.tmp_file = self.root / ".sync-state.json.sync-tmp"
-        self.lock_file = self.root / ".sync.lock"
         self.state = None
 
     def load(self):
@@ -85,39 +84,6 @@ class StateManager:
                 recovered.append({"path": path, "action": "check_target_state"})
 
         return recovered
-
-
-def acquire_lock(root: Path) -> bool:
-    """获取进程锁"""
-    lock_file = Path(root) / ".sync.lock"
-
-    if lock_file.exists():
-        try:
-            data = json.loads(lock_file.read_text())
-            pid = data["pid"]
-            # 检查进程是否存活
-            if psutil.pid_exists(pid):
-                return False
-            else:
-                # 锁过期，删除
-                lock_file.unlink()
-        except Exception:
-            # 锁文件损坏，删除
-            lock_file.unlink()
-
-    # 创建锁
-    lock_file.write_text(json.dumps({
-        "pid": os.getpid(),
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }))
-    return True
-
-
-def release_lock(root: Path):
-    """释放进程锁"""
-    lock_file = Path(root) / ".sync.lock"
-    if lock_file.exists():
-        lock_file.unlink()
 
 
 def cleanup_tmp_files(root: Path):

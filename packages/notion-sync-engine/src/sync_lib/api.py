@@ -1,0 +1,576 @@
+"""库入口（设计 v2 §7.4）：编排八步流水线，不调用 `sys.exit`、不依赖 cwd。
+
+与旧 `cli.cmd_sync` 的差别只有三处（红线「核心同步逻辑零改动」）：
+
+- 事件经 `Reporter` 上报，不再直接 `print`；
+- 出错返回退出码，不再 `sys.exit`；
+- 文件边界与限流等待处响应 `CancelToken`。
+
+`canonical / scanner / remote / planner / plan / executor / state` 的算法未改。
+"""
+
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+from notion_client import Client
+
+from .cancel import CancelToken, Cancelled
+from .canonical import compute_hash, normalize_path
+from .credentials import get_token
+from .executor import Summary, execute_plan
+from .lock import LockBusy, RunLock
+from .plan import build_plan
+from .planner import Action
+from .protocol import EXIT, plan_fingerprint, plan_row, side_label
+from .remote import NotionRemote
+from .reporter import Reporter
+from .scanner import scan_local
+from .state import StateManager, cleanup_tmp_files
+
+# push/pull 各自允许执行的动作（设计 6.1 表）
+_PUSH_ACTIONS = {
+    Action.CREATE_REMOTE,
+    Action.PUSH,
+    Action.ARCHIVE_REMOTE,
+    Action.RENAME,
+    Action.ADOPT,
+}
+_PULL_ACTIONS = {Action.PULL, Action.DELETE_LOCAL, Action.ADOPT}
+
+# 不可执行的动作：仅报告或无动作（CONFLICT 始终只报告）
+_NON_EXECUTABLE = {
+    Action.SKIP,
+    Action.BLOCKED,
+    Action.CONFLICT,
+    Action.UNMANAGED,
+    Action.UNTRACKED,
+    Action.DELETE_STATE,
+}
+
+
+class SyncError(Exception):
+    """致命错误（配置缺失、无 token、未初始化等）。
+
+    取代旧 CLI 里的 `sys.exit(1)`：库不该结束调用方的进程。
+    """
+
+    def __init__(self, message: str, code: str = "fatal"):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass
+class RunOptions:
+    """一次运行的开关。只放引擎真正会读的项。
+
+    刻意不含 `adopt_remote / paths / keep`：那几项属于设计 §7.5 里的 `resolve`
+    命令，而该命令在引擎里并不存在，加了就是死占位符。
+    """
+
+    dry_run: bool = False
+    full: bool = False
+    expect_plan: str | None = None
+    parent_page_id: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "dry_run": self.dry_run,
+            "full": self.full,
+            "expect_plan": self.expect_plan,
+            "parent_page_id": self.parent_page_id,
+        }
+
+
+@dataclass
+class RunResult:
+    exit_code: int
+    summary: dict[str, Any]
+
+
+@dataclass
+class _Context:
+    root: Path
+    config: dict
+    state: StateManager
+    remote: NotionRemote
+
+
+def run(
+    command: str,
+    root: Path | str,
+    opts: RunOptions,
+    rep: Reporter,
+    cancel: CancelToken,
+) -> RunResult:
+    """执行一条命令，返回退出码与摘要；任何情况下都不抛异常给调用方。
+
+    只有 `Cancelled` 与 `LockBusy` 之外的意外异常（如程序缺陷）会继续向上抛，
+    由调用方决定怎么报——把它们伪装成正常退出码会掩盖真实故障。
+    """
+    root = Path(root).resolve()
+    started_at = time.monotonic()
+    run_started = _now_iso()
+    rep.emit(
+        "run.started",
+        command=command,
+        root=str(root),
+        options=opts.as_dict(),
+    )
+
+    if command == "init":
+        return _run_init(root, opts, rep, started_at)
+
+    summary = _empty_summary()
+    done = 0
+    total = 0
+
+    try:
+        with RunLock(root, command):
+            ctx = _load_context(root, opts, cancel, rep)
+
+            rep.emit("phase", name="recover")
+            recovered = ctx.state.recover_pending()
+            if recovered:
+                rep.emit(
+                    "log",
+                    level="info",
+                    message=f"发现 {len(recovered)} 个未完成操作，正在恢复…",
+                )
+            cleanup_tmp_files(root)
+
+            rep.emit("phase", name="scan")
+            local_snapshot = scan_local(root, ctx.config)
+
+            rep.emit("phase", name="remote")
+            remote_index, remote_paths_trashed = _build_remote_index(
+                ctx.remote, ctx.state, ctx.config, local_snapshot, opts.full
+            )
+
+            rep.emit("phase", name="plan")
+            # 第 5 参必须传，否则回收站集合被静默丢弃
+            plan = build_plan(
+                local_snapshot,
+                remote_index,
+                ctx.state.state["files"],
+                ctx.config,
+                remote_paths_trashed,
+            )
+
+            rows, local_hashes, remote_hashes = _plan_rows(
+                plan, local_snapshot, remote_index, ctx.state.state["files"]
+            )
+            fingerprint = plan_fingerprint(plan, local_hashes, remote_hashes)
+            rep.emit(
+                "plan",
+                fingerprint=fingerprint,
+                rows=rows,
+                counts=_counts(plan),
+            )
+
+            if command == "status" or opts.dry_run:
+                return _finish(rep, EXIT.OK, summary, started_at)
+
+            if opts.expect_plan and opts.expect_plan != fingerprint:
+                rep.emit(
+                    "plan.changed", expected=opts.expect_plan, actual=fingerprint
+                )
+                return _finish(rep, EXIT.PLAN_CHANGED, summary, started_at)
+
+            if command == "push":
+                _warn_push_remote_changes(plan, rep)
+
+            filtered = _filter_plan(plan, command)
+            filtered, escape_errors = _check_local_containment(filtered, root)
+
+            # 需要用户处理的计划项：CONFLICT / BLOCKED。注意不能读 summary["conflicts"]
+            # ——它来自 execute_plan，而 CONFLICT 被 _filter_plan 挡在执行之外，
+            # 永远是 0（旧 CLI 的文本输出因此恒为 conflict=0，改动它会破坏文本兼容）。
+            needs_attention = sum(
+                1
+                for c in plan.values()
+                if c.action in (Action.CONFLICT, Action.BLOCKED)
+            )
+
+            rep.emit("phase", name="execute")
+            for err in escape_errors:
+                summary["failed"] += 1
+                # 越界项在进入执行前就被拒，因此没有配对的 file.started
+                rep.emit(
+                    "file.finished",
+                    path=err["path"],
+                    action="",
+                    result="failed",
+                    status="rejected",
+                    error=err["error"],
+                )
+
+            items = sorted(filtered.items())
+            total = len(items)
+            for index, (path, classification) in enumerate(items, 1):
+                cancel.check()
+                action = classification.action.name
+                rep.emit(
+                    "file.started", path=path, action=action, index=index, total=total
+                )
+                item_summary = execute_plan(
+                    {path: classification}, ctx.state, ctx.remote, root, ctx.config
+                )
+                _merge(summary, item_summary)
+                rep.emit(
+                    "file.finished",
+                    path=path,
+                    action=action,
+                    result="failed" if item_summary.errors else "ok",
+                    status="",
+                    error=item_summary.errors[0]["error"] if item_summary.errors else None,
+                )
+                rep.emit("progress", done=index, total=total)
+                done = index
+
+            if not summary["failed"]:
+                ctx.state.state.setdefault("notion", {})[
+                    "remote_watermark"
+                ] = run_started
+                ctx.state.save()
+
+        if summary["failed"]:
+            code = EXIT.FAILED
+        elif needs_attention:
+            code = EXIT.NEEDS_ATTENTION
+        else:
+            code = EXIT.OK
+        return _finish(rep, code, summary, started_at, executed=True)
+
+    except LockBusy as e:
+        rep.emit("lock.busy", holder=e.holder)
+        return RunResult(EXIT.LOCK_BUSY, summary)
+    except Cancelled:
+        rep.emit(
+            "run.cancelled", done=done, remaining=max(total - done, 0)
+        )
+        return RunResult(EXIT.CANCELLED, summary)
+    except SyncError as e:
+        rep.emit("warning", code=e.code, message=str(e))
+        return _finish(rep, EXIT.FATAL, summary, started_at)
+
+
+def _run_init(
+    root: Path, opts: RunOptions, rep: Reporter, started_at: float
+) -> RunResult:
+    """初始化：建远端数据库、写配置、写状态。不加运行锁（此时还没有配置）。"""
+    summary = _empty_summary()
+    try:
+        token, _source = get_token()
+        if not token:
+            # 沿用旧 CLI 的原文，保持文本输出兼容
+            raise SyncError("错误：NOTION_TOKEN 未设置", code="no-token")
+        if not opts.parent_page_id:
+            raise SyncError("init 需要 --parent-page-id", code="no-parent")
+
+        client = Client(auth=token)
+        remote = NotionRemote(client, None, None)
+        db_id, ds_id = remote.create_database(opts.parent_page_id)
+
+        config = {
+            "notion": {
+                "parent_page_id": opts.parent_page_id,
+                "api_version": "2025-09-03",
+            },
+            "include": ["/*.md", "docs/**/*.md", "src/**/*.py"],
+            "exclude": ["artifacts/", ".*/"],
+            "max_chars": 150000,
+            "max_payload_kb": 450,
+            "default_eol": "crlf",
+            "rate_limit_rps": 2.5,
+            "max_retries": 6,
+            "remote_overlap_minutes": 5,
+        }
+        (root / ".sync-config.yaml").write_text(
+            yaml.dump(config, allow_unicode=True), encoding="utf-8"
+        )
+
+        state = StateManager(root)
+        state.load()
+        state.state["notion"] = {"database_id": db_id, "data_source_id": ds_id}
+        state.save()
+
+        rep.emit("log", level="info", message=f"✅ 初始化完成：database_id={db_id}")
+    except SyncError as e:
+        rep.emit("warning", code=e.code, message=str(e))
+        return _finish(rep, EXIT.FATAL, summary, started_at)
+
+    return _finish(rep, EXIT.OK, summary, started_at)
+
+
+def _load_context(
+    root: Path, opts: RunOptions, cancel: CancelToken, rep: Reporter
+) -> _Context:
+    """读配置、取 token、开状态、建远端客户端。缺任何一项都抛 `SyncError`。"""
+    config_path = root / ".sync-config.yaml"
+    if not config_path.exists():
+        raise SyncError(
+            f"未找到 {config_path}，请先运行 notion-sync init", code="no-config"
+        )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    token, _source = get_token()
+    if not token:
+        raise SyncError("错误：NOTION_TOKEN 未设置", code="no-token")
+
+    state = StateManager(root)
+    state.load()
+
+    notion = state.state.get("notion", {})
+    if not notion.get("data_source_id"):
+        raise SyncError(
+            "状态里没有 data_source_id，请先运行 notion-sync init", code="no-state"
+        )
+
+    client = Client(auth=token)
+    remote = NotionRemote(
+        client,
+        notion.get("database_id"),
+        notion.get("data_source_id"),
+        cancel=cancel,
+    )
+    return _Context(root, config, state, remote)
+
+
+def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
+    """步骤 4：构建 remote_index（设计 5.4）。
+
+    - `--full`：对 state.files 里每个有 page_id 的 path 精判（skip 粗筛）。
+    - 否则粗筛：query_candidates(watermark − overlap)，对候选逐个 read_page 精判。
+    - 非候选的已跟踪页面视为 R == BR。
+    - 远端在回收站的 path 收进 remote_paths_trashed。
+    - local 有但 remote_index 没有的 path，用 query_by_paths 探测 ADOPT 场景。
+
+    返回 (remote_index, remote_paths_trashed)。
+    """
+    state_files = state_mgr.state["files"]
+    watermark = state_mgr.state.get("notion", {}).get("remote_watermark")
+
+    remote_index = {}
+    remote_paths_trashed = set()
+
+    if full:
+        candidates = [
+            {
+                "id": entry["page_id"],
+                "path": path,
+                "last_edited_time": entry.get("remote_edited_at"),
+                "in_trash": False,
+            }
+            for path, entry in state_files.items()
+            if entry.get("page_id")
+        ]
+    else:
+        candidates = remote.query_candidates(_watermark_since(watermark, config))
+
+    for cand in candidates:
+        path = cand.get("path")
+        if not path:
+            continue
+        path = normalize_path(path)
+        if cand.get("in_trash"):
+            remote_paths_trashed.add(path)
+            continue
+        content, _block_id, valid = remote.read_page(cand["id"])
+        remote_index[path] = {
+            "page_id": cand["id"],
+            "hash": compute_hash(content) if valid else None,
+            "struct_valid": valid,
+            "last_edited_time": cand.get("last_edited_time"),
+        }
+        entry = state_files.get(path)
+        if entry is not None:
+            entry["remote_edited_at"] = cand.get("last_edited_time")
+
+    # 非候选的已跟踪页面：视为 R == BR
+    for path, entry in state_files.items():
+        if path in remote_index or path in remote_paths_trashed:
+            continue
+        if entry.get("page_id"):
+            remote_index[path] = {
+                "page_id": entry["page_id"],
+                "hash": entry.get("base_remote_hash"),
+                "struct_valid": True,
+                "last_edited_time": entry.get("remote_edited_at"),
+            }
+
+    # ADOPT 探测：local 有但 remote_index 没有的 path
+    probe = [
+        path
+        for path in local_snapshot.files
+        if path not in remote_index and path not in remote_paths_trashed
+    ]
+    if probe:
+        for path, page_id in remote.query_by_paths(probe).items():
+            content, _block_id, valid = remote.read_page(page_id)
+            remote_index[path] = {
+                "page_id": page_id,
+                "hash": compute_hash(content) if valid else None,
+                "struct_valid": valid,
+                "last_edited_time": None,
+            }
+
+    return remote_index, remote_paths_trashed
+
+
+def _plan_rows(plan, local_snapshot, remote_index, state_files):
+    """把 plan 序列化成协议行，并顺带取出指纹要用的 L / R 哈希。
+
+    `plan.py` 里的 `Classification` 不含内容哈希，所以 L / R 只能在这里从
+    本地快照和远端索引取——这也是不改 `plan.py` 就能给出 §3.5 所需指纹的前提。
+    """
+    rows = []
+    local_hashes = {}
+    remote_hashes = {}
+    for path in sorted(plan):
+        entry = state_files.get(path, {})
+        l_exists = path in local_snapshot.files
+        l_hash = local_snapshot.files[path]["hash"] if l_exists else None
+        r_exists = path in remote_index
+        r_hash = remote_index[path]["hash"] if r_exists else None
+
+        local_hashes[path] = l_hash
+        remote_hashes[path] = r_hash
+        rows.append(
+            plan_row(
+                path,
+                plan[path],
+                side_label(l_exists, l_hash, entry.get("base_local_hash")),
+                side_label(r_exists, r_hash, entry.get("base_remote_hash")),
+            )
+        )
+    return rows, local_hashes, remote_hashes
+
+
+def _counts(plan) -> dict[str, int]:
+    """动作 → 条数，供 UI 直接显示，免得它自己再扫一遍 rows。"""
+    counts: dict[str, int] = {}
+    for classification in plan.values():
+        name = classification.action.name
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _filter_plan(plan, command):
+    """步骤 7：按命令过滤动作（设计 6.1 表）。
+
+    CONFLICT 始终只报告（不进执行）；BASELINE 始终执行；push/pull 用各自白名单，
+    sync 执行全部可执行动作。
+    """
+    if command == "push":
+        allowed = _PUSH_ACTIONS
+    elif command == "pull":
+        allowed = _PULL_ACTIONS
+    else:
+        allowed = None  # sync：全部可执行动作
+
+    filtered = {}
+    for path, classification in plan.items():
+        action = classification.action
+        if action in _NON_EXECUTABLE:
+            continue
+        if action == Action.BASELINE or allowed is None or action in allowed:
+            filtered[path] = classification
+    return filtered
+
+
+def _check_local_containment(plan, root):
+    """PULL/DELETE_LOCAL 写本地前：(root/path).resolve() 必须在 root 内，防符号链接逃逸。
+
+    返回 (safe_plan, errors)：越界项从计划中剔除并记入 errors。
+    """
+    root_resolved = Path(root).resolve()
+    safe = {}
+    errors = []
+    for path, classification in plan.items():
+        if classification.action in (Action.PULL, Action.DELETE_LOCAL):
+            target = (Path(root) / path).resolve()
+            if not target.is_relative_to(root_resolved):
+                errors.append({"path": path, "error": "path escapes root"})
+                continue
+        safe[path] = classification
+    return safe, errors
+
+
+def _warn_push_remote_changes(plan, rep: Reporter):
+    """push 计划含 PULL/CONFLICT → 警告远端有修改。"""
+    if any(c.action in (Action.PULL, Action.CONFLICT) for c in plan.values()):
+        rep.emit("warning", code="remote-changes", message="警告：远端有修改，请先 pull 或 sync")
+
+
+def _empty_summary() -> dict[str, Any]:
+    return {
+        "pushed": 0,
+        "pulled": 0,
+        "created": 0,
+        "adopted": 0,
+        "archived": 0,
+        "deleted": 0,
+        "renamed": 0,
+        "baselined": 0,
+        "conflicts": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+
+def _merge(dst: dict, src: Summary) -> None:
+    dst["pushed"] += src.pushed
+    dst["pulled"] += src.pulled
+    dst["created"] += src.created
+    dst["adopted"] += src.adopted
+    dst["archived"] += src.archived
+    dst["deleted"] += src.deleted
+    dst["renamed"] += src.renamed
+    dst["baselined"] += src.baselined
+    dst["conflicts"] += src.conflicts
+    dst["skipped"] += src.skipped
+    dst["failed"] += len(src.errors or [])
+
+
+def _finish(
+    rep: Reporter,
+    code: int,
+    summary: dict,
+    started_at: float,
+    executed: bool = False,
+) -> RunResult:
+    """收尾事件。
+
+    `executed` 只有真正跑过执行阶段才为 True。旧 CLI 在执行阶段之前就 return 的
+    分支（status / --dry-run / init）不打印摘要，`ConsoleReporter` 靠这个标志
+    决定要不要输出摘要行——否则文本输出会多出一行。
+    """
+    rep.emit(
+        "run.finished",
+        exit_code=code,
+        duration_ms=int((time.monotonic() - started_at) * 1000),
+        executed=executed,
+        summary=summary,
+    )
+    return RunResult(code, summary)
+
+
+def _watermark_since(watermark, config):
+    """水位线 − overlap → since_iso（None 表示全量）。"""
+    if watermark is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(watermark.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    dt -= timedelta(minutes=config.get("remote_overlap_minutes", 5))
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _now_iso():
+    """当前 UTC 时间（ISO 8601，Z 结尾）。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -1,12 +1,19 @@
 """Tests for the Notion sync canonical module (text normalization, format
 detection/restoration, rich_text splitting and path validation)."""
 
+import io
 import json
 import os
+import subprocess
+import sys
+import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from keyring.errors import PasswordDeleteError
 
 from sync_lib.canonical import (
     canonical,
@@ -17,8 +24,20 @@ from sync_lib.canonical import (
     split_rich_text,
     validate_path,
 )
+from sync_lib import api, credentials
+from sync_lib.api import RunOptions
+from sync_lib.cancel import CancelToken, Cancelled
 from sync_lib.executor import Summary, _br_from_update_response, execute_plan
+from sync_lib.lock import LockBusy, RunLock
 from sync_lib.plan import build_plan
+from sync_lib.protocol import (
+    EXIT,
+    PROTOCOL_VERSION,
+    plan_fingerprint,
+    plan_row,
+    side_label,
+)
+from sync_lib.reporter import ConsoleReporter, JsonlReporter
 from sync_lib.planner import (
     Action,
     Classification,
@@ -34,12 +53,7 @@ from sync_lib.remote import (
     retry_with_backoff,
 )
 from sync_lib.scanner import LocalSnapshot, scan_local
-from sync_lib.state import (
-    StateManager,
-    acquire_lock,
-    cleanup_tmp_files,
-    release_lock,
-)
+from sync_lib.state import StateManager, cleanup_tmp_files
 
 
 def test_canonical_crlf_to_lf():
@@ -398,29 +412,88 @@ def test_state_recover_pending_create_no_page_id(tmp_path):
     assert recovered[0]["action"] == "adopt_or_skip"
 
 
-# --- state: 进程锁与清理 ---
+# --- lock: 内核文件锁 ---
+#
+# 旧用例断言的是 PID 文件锁（acquire_lock/release_lock）。契约已变：锁改由内核
+# 持有（filelock），不再读 PID、不再把残留的 .sync.lock 当回事，所以下面重写。
 
 
-def test_acquire_lock_success(tmp_path):
-    lock_file = tmp_path / ".sync.lock"
-    assert acquire_lock(tmp_path) is True
-    assert lock_file.exists()
-    release_lock(tmp_path)
-    assert not lock_file.exists()
+def test_run_lock_acquires_and_releases(tmp_path):
+    with RunLock(tmp_path, "sync"):
+        assert (tmp_path / ".sync.lock.json").exists()
+    assert not (tmp_path / ".sync.lock.json").exists()
 
 
-def test_acquire_lock_already_locked(tmp_path):
-    lock_file = tmp_path / ".sync.lock"
-    # 写入一个存活进程的 PID
-    lock_file.write_text(json.dumps({"pid": os.getpid(), "started_at": "2026-10-14T00:00:00Z"}))
-    assert acquire_lock(tmp_path) is False
+def test_run_lock_busy_reports_holder(tmp_path):
+    """同一根目录第二个 RunLock 立刻失败，并带上持有者信息。"""
+    with RunLock(tmp_path, "push"):
+        with pytest.raises(LockBusy) as ei:
+            RunLock(tmp_path, "sync").__enter__()
+    assert ei.value.holder["command"] == "push"
+    assert ei.value.holder["pid"] == os.getpid()
 
 
-def test_acquire_lock_stale(tmp_path):
-    lock_file = tmp_path / ".sync.lock"
-    # 写入一个不存在的 PID
-    lock_file.write_text(json.dumps({"pid": 99999, "started_at": "2026-10-14T00:00:00Z"}))
-    assert acquire_lock(tmp_path) is True  # 锁过期，可以获取
+def test_run_lock_releases_on_error(tmp_path):
+    """with 体里抛错也要放锁。"""
+    with pytest.raises(RuntimeError):
+        with RunLock(tmp_path, "sync"):
+            raise RuntimeError("boom")
+    with RunLock(tmp_path, "sync"):
+        pass
+
+
+def test_run_lock_ignores_stale_file(tmp_path):
+    """磁盘上残留的 .sync.lock 没有语义——内核锁不看它。"""
+    (tmp_path / ".sync.lock").write_text('{"pid": 99999}')
+    with RunLock(tmp_path, "sync"):
+        pass
+
+
+def _wait_lock_free(root, timeout=10.0):
+    """等到能拿到锁为止。
+
+    Windows 上进程被 TerminateProcess 之后，wait() 返回时句柄可能还没全部关闭，
+    锁的释放略有延迟，所以这里给一点重试余量。
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with RunLock(root, "sync"):
+                return
+        except LockBusy:
+            if time.time() > deadline:
+                raise
+            time.sleep(0.05)
+
+
+def test_run_lock_released_when_holder_killed(tmp_path):
+    """强杀持锁进程后，锁必须自动释放（旧 PID 锁做不到这点）。"""
+    script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from sync_lib.lock import RunLock\n"
+        "with RunLock(Path(sys.argv[1]), 'sync'):\n"
+        "    print('locked', flush=True)\n"
+        "    time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "locked"
+        # 进程活着时拿不到锁
+        with pytest.raises(LockBusy):
+            RunLock(tmp_path, "sync").__enter__()
+        proc.kill()
+        proc.wait(timeout=10)
+        # 被强杀（没有走 __exit__）后，内核会释放锁
+        _wait_lock_free(tmp_path)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_cleanup_tmp_files(tmp_path):
@@ -963,7 +1036,7 @@ def test_cli_init(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "test_token")
 
-    with patch("sync_lib.cli.NotionRemote") as mock_remote:
+    with patch("sync_lib.api.NotionRemote") as mock_remote:
         mock_remote.return_value.create_database.return_value = ("db123", "ds123")
 
         with patch("sys.argv", ["sync.py", "init", "--parent-page-id", "page123"]):
@@ -1076,7 +1149,7 @@ def test_query_candidates_uses_retry_and_data_source_id():
     remote = NotionRemote(mock_client, "db123", "ds123")
     remote.limiter.wait = Mock()
 
-    with patch("sync_lib.remote.retry_with_backoff", side_effect=lambda f: f()) as mock_retry:
+    with patch("sync_lib.remote.retry_with_backoff", side_effect=lambda f, **kw: f()) as mock_retry:
         remote.query_candidates(None)
 
     assert mock_retry.call_count == 1
@@ -1763,7 +1836,7 @@ def test_build_plan_trashed_remote_treated_as_absent():
 
 
 class _Args:
-    """cmd_sync 需要的参数命名空间。"""
+    """一次运行的参数命名空间（对齐 api.RunOptions）。"""
 
     def __init__(self, command, dry_run=False, full=False):
         self.command = command
@@ -1771,9 +1844,59 @@ class _Args:
         self.full = full
 
 
+def _sync(args, root=None):
+    """按旧 cmd_sync 的用法调用 api.run，返回 RunResult。
+
+    编排已从 cli.cmd_sync 搬到 api.run（设计 §7.4），所以这里也换入口。
+    """
+    from sync_lib.api import RunOptions, run
+    from sync_lib.cancel import CancelToken
+    from sync_lib.reporter import ConsoleReporter
+
+    opts = RunOptions(dry_run=args.dry_run, full=args.full)
+    return run(
+        args.command,
+        root or Path.cwd(),
+        opts,
+        ConsoleReporter(sys.stdout),
+        CancelToken(),
+    )
+
+
+class _FakeLock:
+    """替代 RunLock，只记录加锁/解锁时机。"""
+
+    def __init__(self, root, command, order=None):
+        self._order = order
+
+    def __enter__(self):
+        if self._order is not None:
+            self._order.append("acquire_lock")
+        return self
+
+    def __exit__(self, *exc):
+        if self._order is not None:
+            self._order.append("release_lock")
+        return False
+
+
 def _write_config(root):
+    """写配置 + 一份「已初始化」的状态。
+
+    api 会校验 data_source_id（旧 cmd_sync 不校验，缺了就拿 None 去请求），
+    所以编排用例必须给出初始化后的状态。
+    """
     (root / ".sync-config.yaml").write_text(
         "include: ['*.md']\nexclude: []\nremote_overlap_minutes: 5\n"
+    )
+    _write_state(
+        root,
+        {
+            "schema_version": 2,
+            "files": {},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
     )
 
 
@@ -1781,9 +1904,21 @@ def _write_state(root, state):
     (root / ".sync-state.json").write_text(json.dumps(state))
 
 
+def _executed(mocks):
+    """api.run 逐项调用 execute_plan，把所有调用里的路径并起来。
+
+    逐项调用是为了在文件边界留取消检查点，同时让 executor.py 一行不改；
+    语义与旧的一次性批量调用等价（execute_plan 本来就是逐项 try/except）。
+    """
+    paths = set()
+    for call in mocks["execute_plan"].call_args_list:
+        paths |= set(call[0][0])
+    return paths
+
+
 def _patch_pipeline(monkeypatch, plan, summary=None, order=None, remote=None):
-    """把 cmd_sync 的外部依赖替换为可控 mock，返回 (mocks, remote)。"""
-    from sync_lib import cli
+    """把 api.run 的外部依赖替换为可控 mock，返回 (mocks, remote)。"""
+    from sync_lib import api
 
     if remote is None:
         remote = Mock()
@@ -1799,8 +1934,6 @@ def _patch_pipeline(monkeypatch, plan, summary=None, order=None, remote=None):
         return _f
 
     mocks = {
-        "acquire_lock": Mock(side_effect=_rec("acquire_lock", True)),
-        "release_lock": Mock(side_effect=_rec("release_lock", None)),
         "scan_local": Mock(side_effect=_rec("scan_local", LocalSnapshot())),
         "build_plan": Mock(side_effect=_rec("build_plan", plan)),
         "execute_plan": Mock(
@@ -1811,16 +1944,15 @@ def _patch_pipeline(monkeypatch, plan, summary=None, order=None, remote=None):
         ),
         "Client": Mock(),
         "NotionRemote": Mock(return_value=remote),
+        "RunLock": lambda root, command: _FakeLock(root, command, order),
     }
     for name, mock in mocks.items():
-        monkeypatch.setattr(cli, name, mock)
+        monkeypatch.setattr(api, name, mock)
     return mocks, remote
 
 
 def test_cmd_sync_pipeline_order(tmp_path, monkeypatch):
     """步骤顺序：acquire_lock → scan_local → build_plan → execute_plan → release_lock。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -1830,7 +1962,7 @@ def test_cmd_sync_pipeline_order(tmp_path, monkeypatch):
         monkeypatch, {"a.md": Classification(Action.PUSH)}, order=order
     )
 
-    cli.cmd_sync(_Args("sync"))
+    _sync(_Args("sync"))
 
     assert order == [
         "acquire_lock",
@@ -1844,8 +1976,6 @@ def test_cmd_sync_pipeline_order(tmp_path, monkeypatch):
 
 def test_cmd_sync_passes_trashed_to_build_plan(tmp_path, monkeypatch):
     """步骤 5 必须显式传第 5 参 remote_paths_trashed（Task C 评审 Important）。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -1866,15 +1996,14 @@ def test_cmd_sync_passes_trashed_to_build_plan(tmp_path, monkeypatch):
         captured["remote_index"] = remote_index
         return {}
 
-    monkeypatch.setattr(cli, "Client", Mock())
-    monkeypatch.setattr(cli, "NotionRemote", Mock(return_value=remote))
-    monkeypatch.setattr(cli, "acquire_lock", Mock(return_value=True))
-    monkeypatch.setattr(cli, "release_lock", Mock())
-    monkeypatch.setattr(cli, "scan_local", Mock(return_value=LocalSnapshot()))
-    monkeypatch.setattr(cli, "build_plan", fake_build_plan)
-    monkeypatch.setattr(cli, "execute_plan", Mock(return_value=Summary(errors=[])))
+    monkeypatch.setattr(api, "Client", Mock())
+    monkeypatch.setattr(api, "NotionRemote", Mock(return_value=remote))
+    monkeypatch.setattr(api, "RunLock", lambda root, command: _FakeLock(root, command))
+    monkeypatch.setattr(api, "scan_local", Mock(return_value=LocalSnapshot()))
+    monkeypatch.setattr(api, "build_plan", fake_build_plan)
+    monkeypatch.setattr(api, "execute_plan", Mock(return_value=Summary(errors=[])))
 
-    cli.cmd_sync(_Args("sync", dry_run=True))
+    _sync(_Args("sync", dry_run=True))
 
     assert captured["trashed"] == {"gone.md"}
     assert "gone.md" not in captured["remote_index"]
@@ -1883,8 +2012,6 @@ def test_cmd_sync_passes_trashed_to_build_plan(tmp_path, monkeypatch):
 
 def test_cmd_sync_dry_run_executes_nothing(tmp_path, monkeypatch):
     """--dry-run 只打印计划，不执行、不推进水位线。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -1900,7 +2027,7 @@ def test_cmd_sync_dry_run_executes_nothing(tmp_path, monkeypatch):
 
     mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
 
-    cli.cmd_sync(_Args("sync", dry_run=True))
+    _sync(_Args("sync", dry_run=True))
 
     mocks["execute_plan"].assert_not_called()
     state = json.loads((tmp_path / ".sync-state.json").read_text())
@@ -1909,59 +2036,57 @@ def test_cmd_sync_dry_run_executes_nothing(tmp_path, monkeypatch):
 
 def test_cmd_sync_status_is_read_only(tmp_path, monkeypatch):
     """status 等价于 sync --dry-run：只读，不执行。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
 
     mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
 
-    cli.cmd_sync(_Args("status"))
+    _sync(_Args("status"))
 
     mocks["execute_plan"].assert_not_called()
 
 
 def test_cmd_sync_releases_lock_on_error(tmp_path, monkeypatch):
-    """finally 中释放锁，即使执行抛错。"""
-    from sync_lib import cli
-
+    """执行抛错时 with 也要退出并放锁。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
 
-    mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+    order = []
+    mocks, _ = _patch_pipeline(
+        monkeypatch, {"a.md": Classification(Action.PUSH)}, order=order
+    )
     mocks["execute_plan"].side_effect = RuntimeError("boom")
 
     with pytest.raises(RuntimeError):
-        cli.cmd_sync(_Args("sync"))
+        _sync(_Args("sync"))
 
-    mocks["release_lock"].assert_called_once()
+    assert order[-1] == "release_lock"
 
 
-def test_cmd_sync_exits_when_lock_held(tmp_path, monkeypatch, capsys):
-    """锁被占用时退出且不释放他人锁。"""
-    from sync_lib import cli
+def test_cmd_sync_reports_lock_busy(tmp_path, monkeypatch, capsys):
+    """锁被占用：返回 LOCK_BUSY，文本与旧 CLI 一致，且不去碰别人的锁。"""
+    from sync_lib.protocol import EXIT
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
 
-    release = Mock()
-    monkeypatch.setattr(cli, "acquire_lock", Mock(return_value=False))
-    monkeypatch.setattr(cli, "release_lock", release)
+    # 真锁真的被占用（另一个 RunLock 正持着）
+    holder = RunLock(tmp_path, "push")
+    holder.__enter__()
+    try:
+        result = _sync(_Args("sync"))
+    finally:
+        holder.__exit__()
 
-    with pytest.raises(SystemExit):
-        cli.cmd_sync(_Args("sync"))
-
-    release.assert_not_called()
+    assert result.exit_code == EXIT.LOCK_BUSY
     assert "另一个同步进程" in capsys.readouterr().out
 
 
 def test_cmd_sync_advances_watermark_on_success(tmp_path, monkeypatch):
     """无 errors 时推进水位线并 save。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -1977,7 +2102,7 @@ def test_cmd_sync_advances_watermark_on_success(tmp_path, monkeypatch):
 
     _patch_pipeline(monkeypatch, {}, summary=Summary(errors=[]))
 
-    cli.cmd_sync(_Args("sync"))
+    _sync(_Args("sync"))
 
     state = json.loads((tmp_path / ".sync-state.json").read_text())
     assert state["notion"]["remote_watermark"].endswith("Z")
@@ -1985,8 +2110,6 @@ def test_cmd_sync_advances_watermark_on_success(tmp_path, monkeypatch):
 
 def test_cmd_sync_no_watermark_on_errors(tmp_path, monkeypatch):
     """有 errors 时不推进水位线。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -2000,11 +2123,14 @@ def test_cmd_sync_no_watermark_on_errors(tmp_path, monkeypatch):
         },
     )
 
+    # 计划里必须真有一条，execute_plan 才会被调用并返回这份带 errors 的摘要
     _patch_pipeline(
-        monkeypatch, {}, summary=Summary(errors=[{"path": "a.md", "error": "x"}])
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH)},
+        summary=Summary(errors=[{"path": "a.md", "error": "x"}]),
     )
 
-    cli.cmd_sync(_Args("sync"))
+    _sync(_Args("sync"))
 
     state = json.loads((tmp_path / ".sync-state.json").read_text())
     assert "remote_watermark" not in state["notion"]
@@ -2012,8 +2138,6 @@ def test_cmd_sync_no_watermark_on_errors(tmp_path, monkeypatch):
 
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -2025,17 +2149,15 @@ def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     }
     mocks, _ = _patch_pipeline(monkeypatch, plan)
 
-    cli.cmd_sync(_Args("push"))
+    _sync(_Args("push"))
 
     assert "远端有修改" in capsys.readouterr().out
-    executed = mocks["execute_plan"].call_args[0][0]
+    executed = _executed(mocks)
     assert set(executed) == {"push.md"}
 
 
 def test_cmd_sync_pull_filters_to_pull_actions(tmp_path, monkeypatch):
     """pull 只执行 PULL/DELETE_LOCAL/ADOPT（+BASELINE）。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -2050,16 +2172,14 @@ def test_cmd_sync_pull_filters_to_pull_actions(tmp_path, monkeypatch):
     }
     mocks, _ = _patch_pipeline(monkeypatch, plan)
 
-    cli.cmd_sync(_Args("pull"))
+    _sync(_Args("pull"))
 
-    executed = mocks["execute_plan"].call_args[0][0]
+    executed = _executed(mocks)
     assert set(executed) == {"pull.md", "delete.md", "adopt.md", "baseline.md"}
 
 
 def test_cmd_sync_sync_executes_all_executable(tmp_path, monkeypatch):
     """sync 执行全部可执行动作，CONFLICT/SKIP 仍只报告。"""
-    from sync_lib import cli
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NOTION_TOKEN", "tok")
     _write_config(tmp_path)
@@ -2078,9 +2198,9 @@ def test_cmd_sync_sync_executes_all_executable(tmp_path, monkeypatch):
     }
     mocks, _ = _patch_pipeline(monkeypatch, plan)
 
-    cli.cmd_sync(_Args("sync"))
+    _sync(_Args("sync"))
 
-    executed = mocks["execute_plan"].call_args[0][0]
+    executed = _executed(mocks)
     assert set(executed) == {
         "push.md",
         "pull.md",
@@ -2112,9 +2232,7 @@ def _filter_sample():
 
 
 def test_filter_plan_push_whitelist():
-    from sync_lib import cli
-
-    filtered = cli._filter_plan(_filter_sample(), "push")
+    filtered = api._filter_plan(_filter_sample(), "push")
     assert set(filtered) == {
         "push.md",
         "create.md",
@@ -2126,16 +2244,12 @@ def test_filter_plan_push_whitelist():
 
 
 def test_filter_plan_pull_whitelist():
-    from sync_lib import cli
-
-    filtered = cli._filter_plan(_filter_sample(), "pull")
+    filtered = api._filter_plan(_filter_sample(), "pull")
     assert set(filtered) == {"pull.md", "adopt.md", "delete.md", "baseline.md"}
 
 
 def test_filter_plan_sync_all_executable():
-    from sync_lib import cli
-
-    filtered = cli._filter_plan(_filter_sample(), "sync")
+    filtered = api._filter_plan(_filter_sample(), "sync")
     assert set(filtered) == {
         "push.md",
         "pull.md",
@@ -2155,15 +2269,13 @@ def test_filter_plan_sync_all_executable():
 
 
 def test_check_local_containment_rejects_escape(tmp_path):
-    from sync_lib import cli
-
     plan = {
         "ok.md": Classification(Action.PULL),
         "gone.md": Classification(Action.DELETE_LOCAL),
         "push.md": Classification(Action.PUSH),
         "../escape.md": Classification(Action.PULL),
     }
-    safe, errors = cli._check_local_containment(plan, tmp_path)
+    safe, errors = api._check_local_containment(plan, tmp_path)
 
     assert set(safe) == {"ok.md", "gone.md", "push.md"}
     assert len(errors) == 1
@@ -2174,8 +2286,6 @@ def test_check_local_containment_rejects_escape(tmp_path):
 
 
 def test_build_remote_index_coarse_reads_candidates(tmp_path):
-    from sync_lib import cli
-
     mgr = StateManager(tmp_path)
     mgr.load()
     mgr.state["notion"] = {"remote_watermark": None}
@@ -2190,7 +2300,7 @@ def test_build_remote_index_coarse_reads_candidates(tmp_path):
     ]
     remote.read_page.return_value = ("content", "b1", True)
 
-    index, trashed = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+    index, trashed = api._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
 
     assert index["a.md"]["page_id"] == "p1"
     assert index["a.md"]["hash"] == compute_hash("content")
@@ -2203,8 +2313,6 @@ def test_build_remote_index_coarse_reads_candidates(tmp_path):
 
 
 def test_build_remote_index_non_candidate_uses_br(tmp_path):
-    from sync_lib import cli
-
     mgr = StateManager(tmp_path)
     mgr.load()
     mgr.state["notion"] = {"remote_watermark": "2026-10-14T00:00:00Z"}
@@ -2216,7 +2324,7 @@ def test_build_remote_index_non_candidate_uses_br(tmp_path):
     remote = Mock()
     remote.query_candidates.return_value = []
 
-    index, _ = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+    index, _ = api._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
 
     assert index["b.md"] == {
         "page_id": "p2",
@@ -2227,8 +2335,6 @@ def test_build_remote_index_non_candidate_uses_br(tmp_path):
 
 
 def test_build_remote_index_probes_adopt(tmp_path):
-    from sync_lib import cli
-
     mgr = StateManager(tmp_path)
     mgr.load()
     mgr.state["notion"] = {"remote_watermark": None}
@@ -2241,7 +2347,7 @@ def test_build_remote_index_probes_adopt(tmp_path):
     remote.query_by_paths.return_value = {"new.md": "p9"}
     remote.read_page.return_value = ("same", "b9", True)
 
-    index, _ = cli._build_remote_index(remote, mgr, {}, snapshot, False)
+    index, _ = api._build_remote_index(remote, mgr, {}, snapshot, False)
 
     assert index["new.md"]["page_id"] == "p9"
     assert index["new.md"]["hash"] == compute_hash("same")
@@ -2249,8 +2355,6 @@ def test_build_remote_index_probes_adopt(tmp_path):
 
 
 def test_build_remote_index_full_skips_coarse(tmp_path):
-    from sync_lib import cli
-
     mgr = StateManager(tmp_path)
     mgr.load()
     mgr.state["notion"] = {"remote_watermark": "2026-10-14T00:00:00Z"}
@@ -2262,7 +2366,7 @@ def test_build_remote_index_full_skips_coarse(tmp_path):
     remote = Mock()
     remote.read_page.return_value = ("content", "b1", True)
 
-    index, _ = cli._build_remote_index(remote, mgr, {}, LocalSnapshot(), True)
+    index, _ = api._build_remote_index(remote, mgr, {}, LocalSnapshot(), True)
 
     remote.query_candidates.assert_not_called()
     assert index["a.md"]["page_id"] == "p1"
@@ -2270,13 +2374,520 @@ def test_build_remote_index_full_skips_coarse(tmp_path):
 
 
 def test_watermark_since_applies_overlap():
-    from sync_lib import cli
-
-    since = cli._watermark_since("2026-10-14T10:00:00Z", {"remote_overlap_minutes": 5})
+    since = api._watermark_since("2026-10-14T10:00:00Z", {"remote_overlap_minutes": 5})
     assert since == "2026-10-14T09:55:00Z"
 
 
 def test_watermark_since_none_is_full():
-    from sync_lib import cli
+    assert api._watermark_since(None, {}) is None
 
-    assert cli._watermark_since(None, {}) is None
+
+# ============================================================================
+# P1：协议序列化 / 取消 / 文本输出黄金对照（设计 §9 P1 退出条件）
+# ============================================================================
+
+
+def _parse_events(text):
+    """把 JSONL 文本解析成事件列表，顺带断言每行都是合法 JSON。"""
+    events = []
+    for line in text.splitlines():
+        if line.strip():
+            events.append(json.loads(line))
+    return events
+
+
+def test_jsonl_reporter_envelope_and_monotonic_seq():
+    buf = io.StringIO()
+    rep = JsonlReporter(buf, run_id="r-abc123")
+    rep.emit("hello", engine_version="1.3.0")
+    rep.emit("plan", rows=[], counts={})
+    rep.emit("run.finished", exit_code=0, summary={})
+
+    events = _parse_events(buf.getvalue())
+
+    assert [e["seq"] for e in events] == [1, 2, 3]  # 单调递增
+    assert {e["v"] for e in events} == {PROTOCOL_VERSION}
+    assert {e["run"] for e in events} == {"r-abc123"}
+    assert [e["type"] for e in events] == ["hello", "plan", "run.finished"]
+    assert events[0]["data"]["engine_version"] == "1.3.0"
+    # ts 是带时区的 ISO 8601
+    datetime.fromisoformat(events[0]["ts"])
+
+
+def test_jsonl_reporter_keeps_chinese_readable():
+    """ensure_ascii=False：中文按原样输出，便于人肉排查协议流。"""
+    buf = io.StringIO()
+    JsonlReporter(buf, run_id="r-1").emit("log", message="发现 2 个未完成操作")
+    assert "发现 2 个未完成操作" in buf.getvalue()
+
+
+def test_cli_json_mode_stdout_is_pure_jsonl(tmp_path):
+    """真实子进程：--json 模式下 stdout 只有合法 JSONL，且以 run.finished 收尾。"""
+    # 空目录 → api 在读配置时就抛 SyncError，不会碰网络
+    proc = subprocess.run(
+        [sys.executable, "-m", "sync_lib.cli", "status", "--json", "--root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    events = _parse_events(proc.stdout)
+    assert events, f"stdout 没有事件：{proc.stdout!r} / {proc.stderr!r}"
+    assert events[0]["type"] == "hello"
+    assert events[-1]["type"] == "run.finished"
+    assert events[-1]["data"]["exit_code"] == EXIT.FATAL
+    # 「没有配置」这件事走 warning 事件，而不是污染协议流的裸 print
+    warning = [e for e in events if e["type"] == "warning"]
+    assert warning and warning[0]["data"]["code"] == "no-config"
+    assert "未找到" in warning[0]["data"]["message"]
+
+
+def test_plan_row_shape_and_fingerprint_stability():
+    plan = {
+        "b.md": Classification(Action.PUSH, "local newer"),
+        "a.md": Classification(Action.PULL),
+        "skip.md": Classification(Action.SKIP),
+    }
+    row = plan_row("b.md", plan["b.md"], "changed", "same")
+    assert row == {
+        "path": "b.md",
+        "action": "PUSH",
+        "reason": "local newer",
+        "local": "changed",
+        "remote": "same",
+    }
+
+    fp = plan_fingerprint(plan)
+    # 同样的计划、不同的插入顺序 → 同一个指纹
+    reordered = dict(reversed(list(plan.items())))
+    assert plan_fingerprint(reordered) == fp
+    # SKIP 不参与指纹
+    assert plan_fingerprint({"skip.md": plan["skip.md"]}) == plan_fingerprint({})
+    # 动作变了 → 指纹变
+    changed = dict(plan)
+    changed["a.md"] = Classification(Action.CONFLICT)
+    assert plan_fingerprint(changed) != fp
+    # L / R 参与指纹：内容哈希变了，指纹也得变
+    assert plan_fingerprint(plan, {"b.md": "L1"}, {}) != plan_fingerprint(
+        plan, {"b.md": "L2"}, {}
+    )
+
+
+def test_side_label_distinguishes_new_from_same():
+    assert side_label(False, None, None) == "absent"
+    assert side_label(True, "h", None) == "new"  # 从未建立基线
+    assert side_label(True, "h", "h") == "same"
+    assert side_label(True, "h", "other") == "changed"
+
+
+# --- 取消 ---
+
+
+def test_cancel_token_check_is_noop_until_cancelled():
+    token = CancelToken()
+    token.check()  # 未取消 → 不抛
+    assert token.cancelled is False
+    token.cancel()
+    assert token.cancelled is True
+    with pytest.raises(Cancelled):
+        token.check()
+
+
+def test_cancel_token_sleep_is_interruptible():
+    token = CancelToken()
+    threading.Timer(0.05, token.cancel).start()
+    start = time.time()
+    with pytest.raises(Cancelled):
+        token.sleep(30)
+    assert time.time() - start < 5  # 立刻返回，不会睡满 30 秒
+
+
+def test_cancelled_escapes_execute_plan(tmp_path):
+    """取消不能被 execute_plan 的 except Exception 记成「该文件失败」。
+
+    这正是 Cancelled 继承 BaseException 的原因：executor 的兜底只抓 Exception，
+    控制流信号必须穿过去，否则取消会被吞掉还留下一条假的失败记录。
+    """
+    (tmp_path / "a.md").write_text("hello", encoding="utf-8")
+    mgr = StateManager(tmp_path)
+    mgr.state = {"schema_version": 2, "files": {}, "tombstones": {}}
+    mgr.update_file(
+        "a.md", {"page_id": "p1", "base_remote_hash": compute_hash("hello")}
+    )
+
+    remote = Mock()
+    remote.read_page.side_effect = Cancelled()
+
+    with pytest.raises(Cancelled):
+        execute_plan({"a.md": Classification(Action.PUSH)}, mgr, remote, tmp_path, {})
+
+
+def test_remote_waiter_is_cancel_aware():
+    token = CancelToken()
+    remote = NotionRemote(Mock(), "db", "ds", cancel=token)
+    assert remote.limiter.waiter == token.sleep
+    # 未传 cancel 时退回 time.sleep
+    assert NotionRemote(Mock(), "db", "ds").limiter.waiter is time.sleep
+
+
+def test_retry_with_backoff_waiter_is_interruptible():
+    token = CancelToken()
+    token.cancel()
+    with pytest.raises(Cancelled):
+        retry_with_backoff(lambda: (_ for _ in ()).throw(Exception("429")), waiter=token.sleep)
+
+
+def test_api_run_cancel_stops_between_files(tmp_path, monkeypatch):
+    """取消发生在文件边界：已完成的文件保留，未开始的文件不再执行。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    token = CancelToken()
+    seen = []
+
+    plan = {
+        "a.md": Classification(Action.PUSH),
+        "b.md": Classification(Action.PUSH),
+        "c.md": Classification(Action.PUSH),
+    }
+
+    def fake_execute(item, *a, **k):
+        seen.append(next(iter(item)))
+        token.cancel()  # 第一个文件跑完就取消
+        return Summary(errors=[])
+
+    from sync_lib import api as api_mod
+
+    _patch_pipeline(monkeypatch, plan)
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    buf = io.StringIO()
+    result = api_mod.run(
+        "sync", tmp_path, RunOptions(), JsonlReporter(buf, "r-x"), token
+    )
+
+    assert result.exit_code == EXIT.CANCELLED
+    assert seen == ["a.md"]  # b.md / c.md 没开始
+    events = _parse_events(buf.getvalue())
+    cancelled = [e for e in events if e["type"] == "run.cancelled"]
+    assert cancelled[-1]["data"] == {"done": 1, "remaining": 2}
+
+
+def test_api_run_expect_plan_mismatch_exits_76(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+
+    buf = io.StringIO()
+    result = api.run(
+        "sync",
+        tmp_path,
+        RunOptions(expect_plan="deadbeef"),
+        JsonlReporter(buf, "r-x"),
+        CancelToken(),
+    )
+
+    assert result.exit_code == EXIT.PLAN_CHANGED
+    mocks["execute_plan"].assert_not_called()
+    events = _parse_events(buf.getvalue())
+    types = [e["type"] for e in events]
+    assert "plan.changed" in types
+    assert "file.started" not in types  # 没有进入执行阶段
+    # 仍然以 run.finished 收尾：UI 靠它判断进程正常结束（而不是崩了）
+    assert types[-1] == "run.finished"
+    assert events[-1]["data"]["exit_code"] == EXIT.PLAN_CHANGED
+
+
+def test_api_run_expect_plan_match_proceeds(tmp_path, monkeypatch):
+    """指纹对得上就照常执行。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    plan = {"a.md": Classification(Action.PUSH)}
+    mocks, _ = _patch_pipeline(monkeypatch, plan)
+
+    buf = io.StringIO()
+    first = api.run(
+        "sync",
+        tmp_path,
+        RunOptions(dry_run=True),
+        JsonlReporter(buf, "r-x"),
+        CancelToken(),
+    )
+    assert first.exit_code == EXIT.OK
+    fp = [e for e in _parse_events(buf.getvalue()) if e["type"] == "plan"][0]["data"][
+        "fingerprint"
+    ]
+
+    result = api.run(
+        "sync",
+        tmp_path,
+        RunOptions(expect_plan=fp),
+        JsonlReporter(io.StringIO(), "r-y"),
+        CancelToken(),
+    )
+
+    assert result.exit_code == EXIT.OK
+    assert mocks["execute_plan"].called
+
+
+def test_api_run_reports_failed_and_needs_attention(tmp_path, monkeypatch):
+    """有失败 → 1；计划里有 CONFLICT/BLOCKED → 2；两者都有时 1 优先。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    _patch_pipeline(
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH)},
+        summary=Summary(errors=[{"path": "a.md", "error": "x"}]),
+    )
+    failed = api.run("sync", tmp_path, RunOptions(), JsonlReporter(io.StringIO(), "r"), CancelToken())
+    assert failed.exit_code == EXIT.FAILED
+
+    _patch_pipeline(monkeypatch, {"c.md": Classification(Action.CONFLICT)})
+    attention = api.run(
+        "sync", tmp_path, RunOptions(), JsonlReporter(io.StringIO(), "r"), CancelToken()
+    )
+    assert attention.exit_code == EXIT.NEEDS_ATTENTION
+
+    _patch_pipeline(
+        monkeypatch,
+        {
+            "c.md": Classification(Action.CONFLICT),
+            "a.md": Classification(Action.PUSH),
+        },
+        summary=Summary(errors=[{"path": "a.md", "error": "x"}]),
+    )
+    both = api.run("sync", tmp_path, RunOptions(), JsonlReporter(io.StringIO(), "r"), CancelToken())
+    assert both.exit_code == EXIT.FAILED
+
+
+def test_api_run_emits_per_file_events(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+    buf = io.StringIO()
+    api.run("sync", tmp_path, RunOptions(), JsonlReporter(buf, "r"), CancelToken())
+
+    events = _parse_events(buf.getvalue())
+    types = [e["type"] for e in events]
+    assert types.index("plan") < types.index("file.started") < types.index("file.finished")
+    assert types[-1] == "run.finished"
+    started = [e for e in events if e["type"] == "file.started"][0]["data"]
+    assert started == {"path": "a.md", "action": "PUSH", "index": 1, "total": 1}
+    progress = [e for e in events if e["type"] == "progress"][0]["data"]
+    assert progress == {"done": 1, "total": 1}
+
+
+def test_api_run_skips_lock_for_init(tmp_path, monkeypatch):
+    """init 时还没有配置，不能要求先加锁。"""
+    from sync_lib import api as api_mod
+
+    def boom(*a, **k):
+        raise AssertionError("init 不该去拿锁")
+
+    monkeypatch.setattr(api_mod, "RunLock", boom)
+    monkeypatch.setattr(api_mod, "get_token", lambda: (None, "none"))
+
+    buf = io.StringIO()
+    result = api_mod.run(
+        "init", tmp_path, RunOptions(parent_page_id="p"), JsonlReporter(buf, "r"), CancelToken()
+    )
+
+    assert result.exit_code == EXIT.FATAL
+
+
+# --- ConsoleReporter：旧 CLI 文本的黄金对照 ---
+
+
+def test_console_reporter_plan_text_matches_legacy():
+    buf = io.StringIO()
+    rep = ConsoleReporter(buf)
+    rep.emit(
+        "plan",
+        fingerprint="fp",
+        rows=[
+            {"path": "a.md", "action": "PUSH", "reason": "local newer"},
+            {"path": "b.md", "action": "PULL", "reason": ""},
+        ],
+        counts={"PUSH": 1, "PULL": 1},
+    )
+    assert buf.getvalue() == (
+        "同步计划：\n"
+        "  push           a.md  (local newer)\n"
+        "  pull           b.md\n"
+    )
+
+
+def test_console_reporter_empty_plan_text_matches_legacy():
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit("plan", fingerprint="fp", rows=[], counts={})
+    assert buf.getvalue() == "计划为空，无需同步\n"
+
+
+def test_console_reporter_summary_text_matches_legacy():
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit(
+        "run.finished",
+        exit_code=0,
+        duration_ms=1,
+        executed=True,
+        summary={
+            "pushed": 1,
+            "pulled": 2,
+            "created": 3,
+            "adopted": 4,
+            "archived": 5,
+            "deleted": 6,
+            "renamed": 7,
+            "baselined": 8,
+            "conflicts": 0,
+            "skipped": 9,
+            "failed": 10,
+        },
+    )
+    assert buf.getvalue() == (
+        "完成：push=1 pull=2 create=3 adopt=4 archive=5 delete=6 "
+        "rename=7 baseline=8 conflict=0 skip=9 errors=10\n"
+    )
+
+
+def test_console_reporter_suppresses_summary_when_not_executed():
+    """status / --dry-run / init 不打印摘要行（旧 CLI 在这些分支直接 return）。"""
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit(
+        "run.finished",
+        exit_code=0,
+        duration_ms=1,
+        executed=False,
+        summary={"pushed": 0, "failed": 0},
+    )
+    assert buf.getvalue() == ""
+
+
+def test_cli_status_text_matches_legacy_shape(tmp_path, monkeypatch, capsys):
+    """端到端：status 的文本输出只有计划，没有摘要行。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+    from sync_lib.cli import main
+
+    assert main(["status"]) == EXIT.OK
+
+    out = capsys.readouterr().out
+    assert out == "同步计划：\n  push           a.md\n"
+
+
+def test_cli_sync_text_matches_legacy_shape(tmp_path, monkeypatch, capsys):
+    """端到端：sync 的文本输出是计划 + 摘要，顺序与旧 CLI 一致。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)})
+    from sync_lib.cli import main
+
+    assert main(["sync"]) == EXIT.OK
+
+    out = capsys.readouterr().out
+    assert out == (
+        "同步计划：\n"
+        "  push           a.md\n"
+        "完成：push=0 pull=0 create=0 adopt=0 archive=0 delete=0 rename=0 "
+        "baseline=0 conflict=0 skip=0 errors=0\n"
+    )
+
+
+def test_console_reporter_prints_no_per_file_lines():
+    """红线：不传 --json 时不出现逐文件行（旧 CLI 执行期间不说话）。"""
+    buf = io.StringIO()
+    rep = ConsoleReporter(buf)
+    rep.emit("file.started", path="a.md", action="PUSH", index=1, total=1)
+    rep.emit("progress", done=1, total=1)
+    rep.emit("file.finished", path="a.md", action="PUSH", result="ok")
+    assert buf.getvalue() == ""
+
+
+def test_console_reporter_lock_busy_text_matches_legacy():
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit("lock.busy", holder={"pid": 1})
+    assert buf.getvalue() == "错误：另一个同步进程正在运行\n"
+
+
+def test_console_reporter_warning_and_log():
+    buf = io.StringIO()
+    rep = ConsoleReporter(buf)
+    rep.emit("warning", code="remote-changes", message="警告：远端有修改，请先 pull 或 sync")
+    rep.emit("log", level="info", message="发现 1 个未完成操作，正在恢复…")
+    assert buf.getvalue() == (
+        "警告：远端有修改，请先 pull 或 sync\n发现 1 个未完成操作，正在恢复…\n"
+    )
+
+
+# --- credentials ---
+
+
+def test_get_token_prefers_env(monkeypatch):
+    monkeypatch.setenv("NOTION_TOKEN", "env-token")
+    monkeypatch.setattr(credentials.keyring, "get_password", lambda *a: "keyring-token")
+    assert credentials.get_token() == ("env-token", "env")
+
+
+def test_get_token_falls_back_to_keyring(monkeypatch):
+    monkeypatch.delenv("NOTION_TOKEN", raising=False)
+    monkeypatch.setattr(credentials.keyring, "get_password", lambda *a: "keyring-token")
+    assert credentials.get_token() == ("keyring-token", "keyring")
+
+
+def test_get_token_none_when_unset(monkeypatch):
+    monkeypatch.delenv("NOTION_TOKEN", raising=False)
+    monkeypatch.setattr(credentials.keyring, "get_password", lambda *a: None)
+    assert credentials.get_token() == (None, "none")
+
+
+def test_save_token_validates_before_storing(monkeypatch):
+    """无效 token 不能落盘：验证失败要抛出去，且不调用 set_password。"""
+    saved = []
+    monkeypatch.setattr(credentials.keyring, "set_password", lambda *a: saved.append(a))
+
+    class _Boom:
+        def __init__(self, auth=None):
+            raise RuntimeError("401 unauthorized")
+
+    with patch("notion_client.Client", _Boom):
+        with pytest.raises(RuntimeError):
+            credentials.save_token("bad")
+    assert saved == []
+
+
+def test_save_token_stores_after_validation(monkeypatch):
+    saved = []
+    monkeypatch.setattr(
+        credentials.keyring, "set_password", lambda service, account, token: saved.append((service, account, token))
+    )
+
+    class _Ok:
+        def __init__(self, auth=None):
+            self.users = Mock(me=Mock(return_value={"id": "u1"}))
+
+    with patch("notion_client.Client", _Ok):
+        credentials.save_token("good-token")
+
+    assert saved == [(credentials.SERVICE, credentials.ACCOUNT, "good-token")]
+
+
+def test_delete_token_ignores_missing_entry(monkeypatch):
+    def _raise(*a):
+        raise PasswordDeleteError("not found")
+
+    monkeypatch.setattr(credentials.keyring, "delete_password", _raise)
+    credentials.delete_token()  # 不该抛

@@ -7,8 +7,6 @@ dependencies = [
   "notion-client>=3.1",
   "pathspec>=0.12",
   "pyyaml>=6",
-  # P0 暂时保留：state.py 的 PID 文件锁还在用；P1 换成 filelock 内核锁后删除
-  "psutil>=5.9",
   "keyring>=25",
   "filelock>=3.13",
 ]
