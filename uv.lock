@@ -333,6 +333,7 @@ dependencies = [
     { name = "platformdirs" },
     { name = "pyside6" },
     { name = "pyside6-fluent-widgets" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -341,6 +342,7 @@ requires-dist = [
     { name = "platformdirs", specifier = ">=4" },
     { name = "pyside6", specifier = ">=6.7" },
     { name = "pyside6-fluent-widgets", specifier = ">=1.7" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [[package]]

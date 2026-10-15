@@ -43,6 +43,16 @@ class StubEngine(QWidget):
         return False
 
 
+class StubQueryEngine(QWidget):
+    """同步页的只读查询（pages）引擎替身：收下命令就完了，绝不真起子进程。"""
+
+    event = Signal(dict)
+    finished = Signal(int, bool)
+
+    def start(self, command: str, root: str, *flags: str) -> None:
+        self.last_start = (command, root, flags)
+
+
 class StubMessageBox:
     def __init__(self, answer: bool):
         self._answer = answer
@@ -87,6 +97,8 @@ def build_window(monkeypatch, tmp_path, tray: bool = False, runs=None):
 
     engine = StubEngine()
     monkeypatch.setattr(mw, "EngineClient", lambda parent=None: engine)
+    # 同步页查目标页面标题时自己会再起一个引擎进程，也挡住
+    monkeypatch.setattr(sync_mod, "EngineClient", lambda parent=None: StubQueryEngine())
     return mw.MainWindow(), engine, tmp_path
 
 

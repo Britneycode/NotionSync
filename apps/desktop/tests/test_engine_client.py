@@ -58,7 +58,7 @@ def start_run(monkeypatch, clients):
     构造完再改实例属性不生效。
     """
 
-    def _start(mode: str, grace_ms: int | None = None):
+    def _start(mode: str, grace_ms: int | None = None, command: str = "sync"):
         monkeypatch.setattr(
             engine_client,
             "engine_command",
@@ -69,7 +69,7 @@ def start_run(monkeypatch, clients):
         client = EngineClient()
         clients.append(client)
         rec = Recorder(client)
-        client.start("sync", "D:/tmp/root")
+        client.start(command, "D:/tmp/root")
         return client, rec
 
     return _start
@@ -229,3 +229,14 @@ def test_cancel_without_running_is_a_noop(qtbot, start_run):
     client.cancel()
     assert not client._kill_timer.isActive()
     assert rec.results == [(0, False)]
+
+
+def test_pages_mode_emits_the_page_list(qtbot, start_run):
+    """只读查询：hello → run.started → pages → run.finished，中间没有任何执行事件。"""
+    client, rec = start_run("pages", command="pages")
+
+    assert wait_finished(qtbot, rec, client) == (0, False)
+
+    assert rec.types == ["hello", "run.started", "pages", "run.finished"]
+    items = rec.events[2]["data"]["items"]
+    assert [p["title"] for p in items] == ["工作台", "归档"]

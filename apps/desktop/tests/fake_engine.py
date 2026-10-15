@@ -109,6 +109,20 @@ def main() -> int:
         time.sleep(60)
         return 0
 
+    if mode == "pages":
+        # 只读的页面列表查询：给同步页把目标 id 换成标题、也给选择器用
+        emit("hello", engine_version="fake")
+        emit("run.started", command="pages", root=flag(argv, "--root") or "", options={})
+        emit(
+            "pages",
+            items=[
+                {"id": "0123456789abcdef0123456789abcdef", "title": "工作台", "url": "u1"},
+                {"id": "fedcba9876543210fedcba9876543210", "title": "归档", "url": "u2"},
+            ],
+        )
+        emit("run.finished", exit_code=0, duration_ms=1, executed=False, summary={})
+        return 0
+
     # normal
     emit("hello", engine_version="fake")
     emit("run.started", command="sync", root=flag(argv, "--root") or "", options={})

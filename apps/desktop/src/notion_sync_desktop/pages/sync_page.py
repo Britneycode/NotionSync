@@ -12,9 +12,11 @@ from qfluentwidgets import (
     BodyLabel,
     CardWidget,
     CaptionLabel,
+    HyperlinkLabel,
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    MessageBox,
     PlainTextEdit,
     PrimaryPushButton,
     ProgressBar,
@@ -25,8 +27,10 @@ from qfluentwidgets import (
 from sync_lib.credentials import get_token
 
 from ..engine_client import EngineClient
+from ..services.notion_target import CONFIG_NAME, read_target
 from ..services.settings import UiSettings
 from ..widgets.folder_drop import FolderDropArea
+from ..widgets.page_picker import PagePickerDialog
 
 # 引擎的阶段名 → 界面文案
 PHASE_LABELS = {
@@ -53,7 +57,7 @@ EXIT_LABELS = {
 
 def is_initialized(folder: str | Path) -> bool:
     """这个文件夹是否已经 init 过（引擎会在这里读配置）。"""
-    return (Path(folder) / ".sync-config.yaml").exists()
+    return (Path(folder) / CONFIG_NAME).exists()
 
 
 class SyncPage(FolderDropArea):
@@ -70,6 +74,11 @@ class SyncPage(FolderDropArea):
         self.engine = engine
         self.settings = UiSettings()
         self._running = False
+        # integration 可见的页面（懒加载）：用来把目标 id 换成标题，也给选择器用
+        self._pages: list[dict] | None = None
+        self._querying = False
+        self._pending_picker = False
+        self._query: EngineClient | None = None
 
         self._build_ui()
         self._wire()
@@ -91,9 +100,9 @@ class SyncPage(FolderDropArea):
         root.addWidget(hint)
 
         root.addWidget(self._folder_card())
-        self.initCard = self._init_card()
-        self.initCard.setVisible(False)
-        root.addWidget(self.initCard)
+        self.targetCard = self._target_card()
+        self.targetCard.setVisible(False)
+        root.addWidget(self.targetCard)
         root.addWidget(self._action_card())
         root.addWidget(self._progress_card())
         root.addWidget(self._log_card(), 1)
@@ -116,20 +125,22 @@ class SyncPage(FolderDropArea):
         layout.addWidget(self.browseButton)
         return card
 
-    def _init_card(self) -> CardWidget:
+    def _target_card(self) -> CardWidget:
+        """「这个文件夹同步到哪个 Notion 页面」——始终可见，也是换页面的入口。"""
         card = CardWidget(self)
         layout = QHBoxLayout(card)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
 
-        self.parentPageEdit = LineEdit(card)
-        self.parentPageEdit.setPlaceholderText("Notion 父页面 ID（在页面链接里，32 位十六进制）")
-        self.parentPageEdit.setClearButtonEnabled(True)
-        self.initButton = PrimaryPushButton("初始化", card)
+        self.targetLabel = BodyLabel("", card)
+        self.targetLabel.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.openTargetLink = HyperlinkLabel("在 Notion 打开", card)
+        self.choosePageButton = PushButton("选择页面…", card)
 
-        layout.addWidget(BodyLabel("尚未初始化", card))
-        layout.addWidget(self.parentPageEdit, 1)
-        layout.addWidget(self.initButton)
+        layout.addWidget(BodyLabel("同步到", card))
+        layout.addWidget(self.targetLabel, 1)
+        layout.addWidget(self.openTargetLink)
+        layout.addWidget(self.choosePageButton)
         return card
 
     def _action_card(self) -> CardWidget:
@@ -189,7 +200,7 @@ class SyncPage(FolderDropArea):
         self.folderDropped.connect(self.set_folder)
         self.folderEdit.editingFinished.connect(self.refresh_folder_state)
         self.browseButton.clicked.connect(self.pick_folder)
-        self.initButton.clicked.connect(self._init_folder)
+        self.choosePageButton.clicked.connect(self._choose_page)
         self.syncButton.clicked.connect(lambda: self.run("sync"))
         self.pushButton.clicked.connect(lambda: self.run("push"))
         self.pullButton.clicked.connect(lambda: self.run("pull"))
@@ -208,9 +219,19 @@ class SyncPage(FolderDropArea):
             self.set_folder(folder)
 
     def refresh_folder_state(self) -> None:
-        """按当前文件夹的初始化状态，决定要不要露出「初始化」卡片。"""
+        """按当前文件夹刷新「同步到」那一行，顺带把目标 id 换成标题。"""
         folder = self.folder()
-        self.initCard.setVisible(bool(folder) and not is_initialized(folder))
+        self.targetCard.setVisible(bool(folder))
+        target = read_target(folder) if folder else None
+        if target is None:
+            self.targetLabel.setText("尚未选择目标页面" if folder else "")
+            self.openTargetLink.setVisible(False)
+            return
+        self.targetLabel.setText(self._page_title(target.parent_page_id) or target.parent_page_id)
+        self.openTargetLink.setUrl(target.url)
+        self.openTargetLink.setVisible(True)
+        # 有目标页面才值得去查标题；还没目标时这次查询留给「选择页面…」自己起
+        self._ensure_pages()
 
     def run(self, command: str, *flags: str) -> None:
         folder = self.folder()
@@ -221,8 +242,8 @@ class SyncPage(FolderDropArea):
             self._warn("文件夹不存在", folder)
             return
         if command != "init" and not is_initialized(folder):
-            self._warn("这个文件夹还没初始化", "填好父页面 ID 后点「初始化」")
-            self.initCard.setVisible(True)
+            self._warn("这个文件夹还没初始化", "点「选择页面…」挑一个目标页面")
+            self.targetCard.setVisible(True)
             return
         if get_token()[0] is None:
             self._warn("还没有 Notion token", "到「设置」里保存一个，或设置环境变量 NOTION_TOKEN")
@@ -237,12 +258,108 @@ class SyncPage(FolderDropArea):
         except RuntimeError as e:
             self._warn("已有任务在运行", str(e))
 
-    def _init_folder(self) -> None:
-        parent = self.parentPageEdit.text().strip()
-        if not parent:
-            self._warn("请填写父页面 ID", "在 Notion 页面链接末尾，32 位十六进制")
+    # ------------------------------------------------------------ 目标页面
+
+    def _page_title(self, page_id: str) -> str:
+        """从缓存的页面列表里找标题；还没查到就是空串。"""
+        for page in self._pages or []:
+            if page.get("id") == page_id:
+                return page.get("title") or ""
+        return ""
+
+    def _choose_page(self) -> None:
+        """点「选择页面…」：列表没缓存就先查一次，查完自动弹出来。"""
+        folder = self.folder()
+        if not folder or not Path(folder).is_dir():
+            self._warn("请先选择文件夹", "拖一个文件夹进来，或点「浏览…」")
             return
-        self.run("init", "--parent-page-id", parent)
+        if self._pages is not None:
+            self._open_picker()
+            return
+
+        self._pending_picker = True
+        self._ensure_pages()
+        if self._querying:
+            self.choosePageButton.setEnabled(False)
+            self.choosePageButton.setText("读取页面…")
+            return
+        # 查不了（没 token / 引擎起不来）：直接弹空列表，对话框里的提示能说明原因
+        self._pending_picker = False
+        self._open_picker()
+
+    def _open_picker(self) -> None:
+        dialog = PagePickerDialog(self._pages or [], self.window())
+        if not dialog.exec():
+            return
+        page = dialog.selected_page()
+        if page is not None:
+            self._init_on_page(page["id"])
+
+    def _init_on_page(self, page_id: str) -> None:
+        """把目标换成这个页面。已初始化的话先说清楚代价——重新初始化会新建一个库。"""
+        if is_initialized(self.folder()) and not self._confirm_reinit():
+            return
+        self.run("init", "--parent-page-id", page_id)
+
+    def _confirm_reinit(self) -> bool:
+        box = MessageBox(
+            "更换目标页面",
+            "这个文件夹已经初始化过。换页面会在新页面下再建一个「Notion Sync」数据库，"
+            "并把所有文件重新推一遍；旧数据库留在原处，不会被删。",
+            self.window(),
+        )
+        box.yesButton.setText("换到新页面")
+        box.cancelButton.setText("算了")
+        return bool(box.exec())
+
+    # -------------------------------------------------- 页面列表（只读查询）
+
+    def _ensure_pages(self) -> None:
+        """懒加载 integration 可见的页面列表；查不到就保持 None，下次再试。"""
+        if self._pages is not None or self._querying:
+            return
+        if get_token()[0] is None:  # 没 token 查不了，也不必打扰用户
+            return
+        folder = self.folder()
+        if not folder or not Path(folder).is_dir():
+            return
+        self._querying = True
+        try:
+            self._query_client().start("pages", folder)
+        except RuntimeError:
+            self._querying = False
+
+    def _query_client(self) -> EngineClient:
+        """只读查询走**另一个**引擎进程：不参与「忙」状态，也不进运行历史。
+
+        它跟同步用的那个 `engine` 各持一个 QProcess、互不干扰——引擎侧 `pages`
+        不拿运行锁，所以能跟同步并发跑（见 DECISIONS）。
+        """
+        if self._query is None:
+            self._query = EngineClient(self)
+            self._query.event.connect(self._on_query_event)
+            self._query.finished.connect(self._on_query_finished)
+        return self._query
+
+    def _on_query_event(self, ev: dict) -> None:
+        if ev.get("type") != "pages":
+            return
+        self._pages = ev["data"].get("items") or []
+        self._querying = False
+        self.refresh_folder_state()  # 这次会真的把 id 换成标题
+        self._on_query_settled()
+
+    def _on_query_finished(self, exit_code: int, crashed: bool) -> None:
+        # 没等到 pages 事件（没 token / 没网 / 引擎挂了）：不缓存，留着下次再试
+        self._querying = False
+        self._on_query_settled()
+
+    def _on_query_settled(self) -> None:
+        self.choosePageButton.setEnabled(not self._running)
+        self.choosePageButton.setText("选择页面…")
+        if self._pending_picker:
+            self._pending_picker = False
+            self._open_picker()
 
     # -------------------------------------------------------- 引擎回调接口
 
@@ -250,7 +367,7 @@ class SyncPage(FolderDropArea):
         self._running = busy
         for button in (self.syncButton, self.pushButton, self.pullButton, self.previewButton):
             button.setEnabled(not busy)
-        self.initButton.setEnabled(not busy)
+        self.choosePageButton.setEnabled(not busy and not self._querying)
         self.cancelButton.setVisible(busy)
         if busy:
             # 还不知道总数：先转起来
@@ -301,7 +418,7 @@ class SyncPage(FolderDropArea):
         self.append_log("info", self.summary_text(summary))
 
     def on_run_finished(self, exit_code: int) -> None:
-        """进程结束后刷新一次初始化状态：init 成功后「初始化」卡片要收起来。"""
+        """进程结束后刷新一次目标显示：init 成功后「同步到」要换成新页面。"""
         self.refresh_folder_state()
         label = EXIT_LABELS.get(exit_code, f"退出码 {exit_code}")
         if exit_code not in (0,):

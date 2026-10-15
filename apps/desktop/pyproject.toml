@@ -7,6 +7,8 @@ dependencies = [
   "PySide6>=6.7",
   "PySide6-Fluent-Widgets>=1.7",
   "platformdirs>=4",
+  # 读文件夹里的 .sync-config.yaml（拿目标页面的 id）；引擎也是用它写这份配置的
+  "pyyaml>=6",
 ]
 
 [project.gui-scripts]
