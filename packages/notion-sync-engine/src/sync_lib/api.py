@@ -135,6 +135,11 @@ def run(
     if command == "init":
         return _run_init(root, opts, rep, started_at)
 
+    if command == "pages":
+        # 只读查询，跟 init 一样不读配置、不拿运行锁——它只认 token，跟某个文件夹
+        # 无关，所以能在同步进行中并发跑（拿锁的话会撞上退出码 75）
+        return _run_pages(rep, started_at)
+
     summary = _empty_summary()
     done = 0
     total = 0
@@ -315,6 +320,25 @@ def _run_init(
         state.save()
 
         rep.emit("log", level="info", message=f"✅ 初始化完成：database_id={db_id}")
+    except SyncError as e:
+        rep.emit("warning", code=e.code, message=str(e))
+        return _finish(rep, EXIT.FATAL, summary, started_at)
+
+    return _finish(rep, EXIT.OK, summary, started_at)
+
+
+def _run_pages(rep: Reporter, started_at: float) -> RunResult:
+    """列出 integration 能访问的页面（只读）。给界面的「选择目标页面」用。"""
+    summary = _empty_summary()
+    try:
+        token, _source = get_token()
+        if not token:
+            # 沿用旧 CLI 的原文，保持文本输出兼容
+            raise SyncError("错误：NOTION_TOKEN 未设置", code="no-token")
+
+        client = Client(auth=token)
+        remote = NotionRemote(client, None, None)
+        rep.emit("pages", items=remote.search_pages())
     except SyncError as e:
         rep.emit("warning", code=e.code, message=str(e))
         return _finish(rep, EXIT.FATAL, summary, started_at)

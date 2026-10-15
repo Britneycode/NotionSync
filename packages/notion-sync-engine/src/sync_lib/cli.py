@@ -49,7 +49,9 @@ class _EventLogHandler(logging.Handler):
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="notion-sync", description="Notion 双向同步")
     # 只列引擎真正实现的命令；设计 §7.5 里的 forget/rebuild-state 尚未实现
-    p.add_argument("command", choices=["init", "status", "push", "pull", "sync", "resolve"])
+    p.add_argument(
+        "command", choices=["init", "status", "push", "pull", "sync", "resolve", "pages"]
+    )
     p.add_argument(
         "path",
         nargs="?",

@@ -1034,6 +1034,104 @@ def test_create_database_declares_all_five_properties():
     assert set(option_names) == {"markdown", "python", "yaml", "toml", "text"}
 
 
+# --- remote: search_pages（界面「选择目标页面」的只读查询） ---
+
+
+def _search_page(page_id, title, url="https://www.notion.so/x", prop="title"):
+    """构造 search 返回的 page 对象：标题在 properties 里那个 title 型属性上。"""
+    return {
+        "object": "page",
+        "id": page_id,
+        "url": url,
+        "properties": {
+            prop: {"id": prop, "type": "title", "title": [{"plain_text": title}]},
+        },
+    }
+
+
+def test_search_pages_reads_title_and_url():
+    mock_client = Mock()
+    mock_client.search.return_value = {
+        "results": [_search_page("p1", "工作台", "https://www.notion.so/p1")],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    assert remote.search_pages() == [
+        {"id": "p1", "title": "工作台", "url": "https://www.notion.so/p1"}
+    ]
+    remote.limiter.wait.assert_called_once()
+    body = mock_client.search.call_args[1]
+    assert body["filter"] == {"property": "object", "value": "page"}
+    assert "start_cursor" not in body  # 首页不带游标
+
+
+def test_search_pages_paginates_and_sorts_by_title():
+    mock_client = Mock()
+    mock_client.search.side_effect = [
+        {"results": [_search_page("p1", "B 页")], "has_more": True, "next_cursor": "c1"},
+        {"results": [_search_page("p2", "A 页")], "has_more": False},
+    ]
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    pages = remote.search_pages()
+
+    assert [p["id"] for p in pages] == ["p2", "p1"]  # 按标题排，不是按返回顺序
+    assert mock_client.search.call_count == 2
+    assert mock_client.search.call_args_list[1][1]["start_cursor"] == "c1"
+
+
+def test_search_pages_takes_the_title_property_from_a_database_row():
+    """挂在数据库下的行，标题属性叫 Name 而不是 title。"""
+    mock_client = Mock()
+    mock_client.search.return_value = {
+        "results": [
+            {
+                "id": "p1",
+                "url": "u",
+                "properties": {
+                    "Path": {"type": "rich_text", "rich_text": [{"plain_text": "a.md"}]},
+                    "Name": {"type": "title", "title": [{"plain_text": "a.md"}]},
+                },
+            }
+        ],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    assert remote.search_pages()[0]["title"] == "a.md"
+
+
+def test_search_pages_without_a_title_property_is_empty_not_a_crash():
+    mock_client = Mock()
+    mock_client.search.return_value = {
+        "results": [{"id": "p1", "properties": {}}],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    assert remote.search_pages() == [{"id": "p1", "title": "", "url": ""}]
+
+
+def test_search_pages_with_nothing_visible_returns_empty():
+    """integration 没被连接到任何页面时，search 就是空的——不是错误。"""
+    mock_client = Mock()
+    mock_client.search.return_value = {"results": [], "has_more": False}
+
+    remote = NotionRemote(mock_client, None, None)
+    remote.limiter = Mock()
+
+    assert remote.search_pages() == []
+
+
 # --- cli: 命令入口（Task 8） ---
 
 
@@ -2722,6 +2820,58 @@ def test_api_run_skips_lock_for_init(tmp_path, monkeypatch):
     assert result.exit_code == EXIT.FATAL
 
 
+def test_api_run_skips_lock_for_pages(tmp_path, monkeypatch):
+    """pages 是只读查询，不该拿锁——拿了就会在同步进行中撞上退出码 75。"""
+    from sync_lib import api as api_mod
+
+    def boom(*a, **k):
+        raise AssertionError("pages 不该去拿锁")
+
+    monkeypatch.setattr(api_mod, "RunLock", boom)
+    monkeypatch.setattr(api_mod, "get_token", lambda: (None, "none"))
+
+    buf = io.StringIO()
+    result = api_mod.run(
+        "pages", tmp_path, RunOptions(), JsonlReporter(buf, "r"), CancelToken()
+    )
+
+    assert result.exit_code == EXIT.FATAL
+
+
+def test_api_run_pages_emits_the_items(tmp_path, monkeypatch):
+    from sync_lib import api as api_mod
+
+    monkeypatch.setattr(api_mod, "get_token", lambda: ("tok", "env"))
+    monkeypatch.setattr(api_mod, "Client", lambda auth: Mock())
+    remote = Mock()
+    remote.search_pages.return_value = [{"id": "p1", "title": "工作台", "url": "u"}]
+    monkeypatch.setattr(api_mod, "NotionRemote", lambda *a, **k: remote)
+
+    buf = io.StringIO()
+    result = api_mod.run(
+        "pages", tmp_path, RunOptions(), JsonlReporter(buf, "r"), CancelToken()
+    )
+
+    assert result.exit_code == EXIT.OK
+    events = _parse_events(buf.getvalue())
+    emitted = [e for e in events if e["type"] == "pages"]
+    assert emitted[0]["data"]["items"] == [{"id": "p1", "title": "工作台", "url": "u"}]
+    assert events[-1]["type"] == "run.finished"
+    # 只读命令不进入执行阶段，摘要行不该出现
+    assert events[-1]["data"]["executed"] is False
+
+
+def test_cli_accepts_pages(tmp_path, monkeypatch):
+    """argparse 的 choices 里必须有 pages——没有的话界面根本发不出这条命令。"""
+    from sync_lib import api as api_mod
+    from sync_lib.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api_mod, "get_token", lambda: (None, "none"))
+
+    assert main(["pages"]) == EXIT.FATAL
+
+
 # --- ConsoleReporter：旧 CLI 文本的黄金对照 ---
 
 
@@ -2849,6 +2999,25 @@ def test_console_reporter_warning_and_log():
     assert buf.getvalue() == (
         "警告：远端有修改，请先 pull 或 sync\n发现 1 个未完成操作，正在恢复…\n"
     )
+
+
+def test_console_reporter_pages_text():
+    """pages 是全新命令，没有旧 CLI 对照，格式自定：一行一个「标题  id」。"""
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit(
+        "pages",
+        items=[
+            {"id": "p1", "title": "工作台", "url": "u"},
+            {"id": "p2", "title": "归档", "url": "u"},
+        ],
+    )
+    assert buf.getvalue() == "工作台  p1\n归档  p2\n"
+
+
+def test_console_reporter_pages_with_nothing_visible():
+    buf = io.StringIO()
+    ConsoleReporter(buf).emit("pages", items=[])
+    assert "没有可见的页面" in buf.getvalue()
 
 
 # --- credentials ---

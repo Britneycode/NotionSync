@@ -206,6 +206,19 @@ class NotionRemote:
         plain = rich_text[0].get("plain_text")
         return plain if plain else None
 
+    @staticmethod
+    def _page_title(page) -> str:
+        """取页面的标题：properties 里第一个 type == "title" 的属性，拼 plain_text。
+
+        search 返回的 page 对象没有顶层 title——标题是 properties 里那个 title 型属性
+        （独立页面叫 title，挂在数据库下的行叫 Name）。取不到就给空串。
+        """
+        for prop in page.get("properties", {}).values():
+            if prop.get("type") != "title":
+                continue
+            return "".join(rt.get("plain_text", "") for rt in prop.get("title", []))
+        return ""
+
     def _list_children(self, page_id: str) -> list:
         """分页拉全页面的全部子块（按文档顺序）"""
         blocks = []
@@ -316,6 +329,41 @@ class NotionRemote:
         database_id = response["id"]
         data_source_id = response["data_sources"][0]["id"]
         return database_id, data_source_id
+
+    def search_pages(self) -> list[dict]:
+        """列出 integration 能访问的全部页面，返回 [{"id", "title", "url"}]。
+
+        只读，给界面的「选择目标页面」用。search 只返回**被显式连接给 integration**
+        的页面，所以列表为空通常意味着还没在页面右上角把 integration 连上。
+        按标题排序，让选择列表稳定好找（search 自身只能按 last_edited_time 排）。
+        """
+        pages = []
+        start_cursor = None
+        while True:
+            self.limiter.wait()
+            body = {
+                "filter": {"property": "object", "value": "page"},
+                "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+                "page_size": 100,
+            }
+            if start_cursor is not None:
+                body["start_cursor"] = start_cursor
+
+            response = self._retry(lambda: self.client.search(**body))
+
+            for page in response["results"]:
+                pages.append({
+                    "id": page["id"],
+                    "title": self._page_title(page),
+                    "url": page.get("url", ""),
+                })
+
+            if not response.get("has_more"):
+                break
+            start_cursor = response.get("next_cursor")
+
+        pages.sort(key=lambda p: p["title"].casefold())
+        return pages
 
     def _map_language(self, file_type):
         """映射文件类型到 Notion language"""

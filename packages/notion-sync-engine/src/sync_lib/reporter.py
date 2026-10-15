@@ -66,6 +66,9 @@ class ConsoleReporter:
             # 旧 CLI 在这里只会抛 KeyboardInterrupt 堆栈，没有既定格式
             self._s.write("已取消\n")
             self._s.flush()
+        elif type == "pages":
+            # 全新命令，没有旧 CLI 的对照，格式自己定
+            self._pages(d)
         elif type in ("warning", "log"):
             self._s.write(f"{d.get('message', '')}\n")
             self._s.flush()
@@ -81,6 +84,17 @@ class ConsoleReporter:
                 if row.get("reason"):
                     line += f"  ({row['reason']})"
                 self._s.write(line + "\n")
+        self._s.flush()
+
+    def _pages(self, d: dict) -> None:
+        items = d.get("items") or []
+        if not items:
+            self._s.write(
+                "没有可见的页面：先在 Notion 里把目标页面连接给这个 integration\n"
+            )
+        else:
+            for item in items:
+                self._s.write(f"{item.get('title', '')}  {item.get('id', '')}\n")
         self._s.flush()
 
     def _summary(self, s: dict) -> None:
