@@ -291,15 +291,180 @@ def _execute_conflict(path, state_mgr, remote, local_root):
     """执行 CONFLICT：远端内容备份到本地，标 conflict；本地不动（设计 6.5）"""
     entry = state_mgr.get_file(path)
     content, _, _ = remote.read_page(entry["page_id"])
+    _write_remote_backup(path, content, local_root)
 
+    state_mgr.update_file(path, {"status": "conflict"})
+    state_mgr.save()
+
+
+@dataclass
+class ResolveResult:
+    """一次 `resolve` 的结果，供调用方汇总与提示。"""
+
+    summary: Summary
+    backup: str | None  # 被放弃那一侧的备份文件（相对 root）；没有备份则 None
+
+
+def resolve_conflict(
+    path,
+    keep,
+    state_mgr,
+    remote,
+    local_root,
+    local_exists,
+    remote_exists,
+    page_id,
+):
+    """按用户裁决解决一个冲突项（设计 6.5 / 6.6）。
+
+    刻意**不新增同步算法**：先把该文件的基线重新定到"用户选中的那一侧"，
+    再交给既有的 push / pull / archive_remote / delete_local / create 原语执行。
+    冲突解决与日常同步因此共用同一套写盘、备份与乐观校验代码。
+
+    四种冲突形态（planner 都会产出 CONFLICT）各自的 `keep` 含义：
+
+    ==================  ====================  ==================  ==========
+    形态                keep=local            keep=remote         keep=merged
+    ==================  ====================  ==================  ==========
+    两端都改            备份远端后推本地      备份本地后拉远端    同 local
+    未跟踪但远端有同名页 备份远端后推本地      备份本地后拉远端    同 local
+    本地删、远端改       确认删除（归档远端）  拉回本地（重建）    不适用，报错
+    远端删、本地改       重建远端页            确认删除（删本地）  不适用，报错
+    ==================  ====================  ==================  ==========
+
+    `keep=merged` 表示用户已把合并结果写进了本地文件，因此与 `local` 同路。
+    """
+    if keep not in ("local", "remote", "merged"):
+        raise ValueError(f"unknown keep: {keep!r}（应为 local / remote / merged）")
+    if not local_exists and not remote_exists:
+        raise ValueError(f"{path}: 两侧都不存在，不是冲突")
+
+    local_root = Path(local_root)
+    summary = Summary(errors=[])
+    backup = None
+
+    if local_exists and remote_exists:
+        if keep == "remote":
+            backup = _backup_local(path, local_root)
+            _seed_state(path, state_mgr, local_root, page_id)
+            _execute_pull(path, state_mgr, remote, local_root)
+            summary.pulled += 1
+        else:
+            # 只读一次远端：备份与重新定基线都用它。6.6 的竞态窗口从这次读取开始算，
+            # 之后 _execute_push 会再读一次并比对，窗口内又变则中止。
+            content, block_id, valid = remote.read_page(page_id)
+            if not valid:
+                raise Exception("remote invalid-structure")
+            backup = _write_remote_backup(path, content, local_root)
+            _rebase_remote(path, state_mgr, local_root, page_id, block_id, content)
+            _execute_push(path, state_mgr, remote, local_root)
+            summary.pushed += 1
+
+    elif remote_exists:
+        # 本地没了、远端还在
+        if keep == "merged":
+            raise ValueError(f"{path}: 本地已删除，没有可合并的本地版本")
+        if keep == "remote":
+            _seed_state(path, state_mgr, local_root, page_id)
+            _execute_pull(path, state_mgr, remote, local_root)
+            summary.pulled += 1
+        else:
+            content, _, valid = remote.read_page(page_id)
+            if not valid:
+                raise Exception("remote invalid-structure")
+            backup = _write_remote_backup(path, content, local_root)
+            _rebase_remote(path, state_mgr, local_root, page_id, None, content)
+            _execute_archive_remote(path, state_mgr, remote)
+            summary.archived += 1
+
+    else:
+        # 远端没了、本地还在
+        if keep == "merged":
+            raise ValueError(f"{path}: 远端已删除，没有可合并的远端版本")
+        if keep == "remote":
+            # _execute_delete_local 自己会把本地文件移进 .sync-backup/deleted/
+            _execute_delete_local(path, state_mgr, local_root)
+            summary.deleted += 1
+        else:
+            _execute_create(path, state_mgr, remote, local_root)
+            summary.created += 1
+
+    # 归档远端 / 删本地这两条路会直接把状态条目删掉（改由 tombstone 记录），
+    # 不能再往里写 status——那会把一个已经删掉的条目复活成没有哈希的空壳。
+    if path in state_mgr.state["files"]:
+        state_mgr.update_file(path, {"status": "synced"})
+        state_mgr.save()
+
+    # 相对 root 的 POSIX 形式：协议里所有路径都是这个形状，界面直接 root / 它 就能拼回绝对路径
+    return ResolveResult(summary, backup.relative_to(local_root).as_posix() if backup else None)
+
+
+def _rebase_remote(path, state_mgr, local_root, page_id, block_id, content):
+    """把冲突项重新定基线到"本地胜出"：BR 刷成刚读到的远端哈希。
+
+    `_execute_push` 的 6.6 写前校验拿当前 R 跟 BR 比，而冲突的定义就是 R ≠ BR，
+    不刷基线它必然拒绝执行。刷成"刚读到的 R"之后校验仍然成立：它挡的是
+    这次读取到写入之间的窗口，不是冲突本身。
+    """
+    state_mgr.update_file(path, {"base_remote_hash": compute_hash(content)})
+    _seed_state(path, state_mgr, local_root, page_id, block_id)
+
+
+def _seed_state(path, state_mgr, local_root, page_id=None, block_id=None):
+    """(b) 形态（状态里压根没这个文件）在拉取/推送前补齐 entry 字段。
+
+    `_execute_pull` 要 page_id 和 format，`_execute_push` 要 page_id，缺了就是
+    KeyError。format 从本地文件探出来——`_execute_pull` 要按它还原换行与 BOM。
+    """
+    entry = state_mgr.get_file(path)
+    updates = {}
+    if page_id and not entry.get("page_id"):
+        updates["page_id"] = page_id
+    if block_id and not entry.get("block_id"):
+        updates["block_id"] = block_id
+    if not entry.get("format"):
+        src = local_root / path
+        if src.is_file():
+            updates["format"] = detect_format(src.read_bytes())
+    if updates:
+        state_mgr.update_file(path, updates)
+
+
+def backup_remote_content(path, remote, local_root, page_id) -> Path:
+    """把远端内容落盘成一份「远端副本」，供界面做本地 ↔ 远端对比（设计 §226）。
+
+    落点与命名跟 `_execute_conflict` 完全一致（`.sync-backup/conflicts/`），
+    所以对比看到的就是「保留本地」时会被放弃的那份内容。不改状态、不做裁决。
+    """
+    content, _, valid = remote.read_page(page_id)
+    if not valid:
+        raise Exception("remote invalid-structure")
+    return _write_remote_backup(path, content, local_root)
+
+
+def _write_remote_backup(path, content, local_root) -> Path:
+    """覆盖远端前先把远端文本备份到本地（设计 6.5 第 5 条）。
+
+    带时间戳：同一个文件可能被解决多次，不能互相覆盖。
+    """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     ext = PurePosixPath(path).suffix
     backup = local_root / ".sync-backup" / "conflicts" / f"{path}.remote-{timestamp}{ext}"
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_text(content or "", encoding="utf-8")
+    return backup
 
-    state_mgr.update_file(path, {"status": "conflict"})
-    state_mgr.save()
+
+def _backup_local(path, local_root) -> Path | None:
+    """覆盖本地前先把本地文件备份（设计 6.5）。本地不存在时返回 None。"""
+    src = local_root / path
+    if not src.is_file():
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    backup = local_root / ".sync-backup" / "overwritten" / f"{path}.{timestamp}"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, backup)
+    return backup
 
 
 def _add_tombstone(state_mgr, path, page_id, side):

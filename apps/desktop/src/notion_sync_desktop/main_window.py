@@ -1,7 +1,7 @@
 """主窗口与事件分发（设计 v2 §7.10）。
 
 `_on_event` 是协议事件唯一的落点：一个事件类型对应一个处理。
-P2 只挂「同步」和「设置」两页；计划页、历史页、托盘分别是 P3 / P4。
+计划页在 P3 接入；历史页与托盘是 P4。
 """
 
 from PySide6.QtWidgets import QApplication
@@ -15,6 +15,8 @@ from qfluentwidgets import (
 )
 
 from .engine_client import EngineClient
+from .models.plan_model import PlanTableModel
+from .pages.plan_page import PlanPage
 from .pages.settings_page import SettingsPage
 from .pages.sync_page import SyncPage
 
@@ -27,9 +29,13 @@ class MainWindow(FluentWindow):
         self.setMicaEffectEnabled(True)  # Win10 上会自动降级为纯色
 
         self.engine = EngineClient(self)
+        self.plan_model = PlanTableModel(self)
         self.sync_page = SyncPage(self.engine, self)
+        # 文件夹只有「同步」页那一份；计划页要用时现取，免得两处各存一份会走岔
+        self.plan_page = PlanPage(self.plan_model, self.sync_page.folder, self)
         self.settings_page = SettingsPage(self)
         self.addSubInterface(self.sync_page, FIF.SYNC, "同步")
+        self.addSubInterface(self.plan_page, FIF.DOCUMENT, "计划预览")
         self.addSubInterface(
             self.settings_page, FIF.SETTING, "设置", NavigationItemPosition.BOTTOM
         )
@@ -38,7 +44,11 @@ class MainWindow(FluentWindow):
         self.engine.diagnostic.connect(self.sync_page.append_diagnostic)
         self.engine.finished.connect(self._on_finished)
         self.engine.runningChanged.connect(self.sync_page.set_busy)
+        self.engine.runningChanged.connect(self.plan_page.set_busy)
         self.sync_page.openSettingsRequested.connect(self._show_settings)
+        self.sync_page.previewRequested.connect(self._preview_plan)
+        # 计划页的命令一律经「同步」页发出，文件夹校验与日志只有一份
+        self.plan_page.runRequested.connect(self._run_from_plan)
 
     # ------------------------------------------------------------ 事件分发
 
@@ -49,10 +59,15 @@ class MainWindow(FluentWindow):
         elif t == "phase":
             self.sync_page.set_phase(d["name"])
         elif t == "plan":
-            self._log_plan(d)
+            self.plan_model.set_plan(d["fingerprint"], d.get("rows") or [])
+            self.plan_page.set_counts(d.get("counts") or {})
+            self.sync_page.append_log(
+                "info", f"计划已更新（{len(d.get('rows') or [])} 项）"
+            )
         elif t == "file.started":
             self.sync_page.set_current(d["path"], d["index"], d["total"])
         elif t == "file.finished":
+            self.plan_model.update_result(d["path"], d["result"], d.get("error"))
             self.sync_page.append_file_result(d)
         elif t == "progress":
             self.sync_page.set_progress(d["done"], d["total"])
@@ -70,11 +85,12 @@ class MainWindow(FluentWindow):
                 position=InfoBarPosition.TOP_RIGHT,
             )
         elif t == "plan.changed":
-            self.sync_page.append_log("warning", "计划已变化，本次未执行（P3 会在这里自动重出预览）")
+            self.sync_page.append_log("warning", "计划已过期，本次未执行；已重新预览")
             InfoBar.warning(
-                "计划已过期", "预览之后内容又有变化，已跳过执行", parent=self,
+                "计划已过期", "预览之后内容又有变化，已跳过执行并重新预览", parent=self,
                 position=InfoBarPosition.TOP_RIGHT, duration=6000,
             )
+            self._preview_plan()
         elif t == "run.cancelled":
             self.sync_page.append_log(
                 "warning", f"已取消：完成 {d['done']}，剩余 {d['remaining']}"
@@ -82,25 +98,10 @@ class MainWindow(FluentWindow):
         elif t == "run.finished":
             self.sync_page.show_summary(d["summary"], d["exit_code"])
 
-    def _log_plan(self, d: dict) -> None:
-        """P2 没有计划页，把计划按旧界面的做法打进日志。
-
-        P3 接入 PlanPage 后，这里改成只留一行概要。
-        """
-        rows = d.get("rows") or []
-        if not rows:
-            self.sync_page.append_log("info", "计划为空，无需同步")
-            return
-        counts = "，".join(f"{k}={v}" for k, v in sorted(d.get("counts", {}).items()))
-        self.sync_page.append_log("info", f"同步计划（{len(rows)} 项）：{counts}")
-        for row in rows:
-            line = f"  {row['action'].lower():<14} {row['path']}"
-            if row.get("reason"):
-                line += f"  ({row['reason']})"
-            self.sync_page.append_log("info", line)
-
     def _on_finished(self, code: int, crashed: bool) -> None:
         self.sync_page.on_run_finished(code)
+        # 「打开对比」的 `--backup-only` 跑完了，该拉 diff 了
+        self.plan_page.on_run_finished(code)
         if crashed and code != 130:
             InfoBar.error(
                 "引擎异常退出", "详细信息见日志", parent=self,
@@ -111,6 +112,19 @@ class MainWindow(FluentWindow):
 
     def _show_settings(self) -> None:
         self.switchTo(self.settings_page)
+
+    def _preview_plan(self) -> None:
+        """「同步」页的「预览计划」：切到计划页并立刻重出一遍。"""
+        self.switchTo(self.plan_page)
+        self.plan_page.refresh_preview()
+
+    def _run_from_plan(self, command: str, flags: list) -> None:
+        """计划页只管表达意图，进程由「同步」页起——它手里有文件夹校验和日志。
+
+        刻意不切页：裁决和执行的结果就显示在计划表格那一行上，
+        提示条挂在主窗口上（见 SyncPage 的 `_warn`），在计划页也看得见。
+        """
+        self.sync_page.run(command, *flags)
 
     def closeEvent(self, e) -> None:
         """同步进行中不让直接关：先确认，再走取消流程，进程退出后才关。"""

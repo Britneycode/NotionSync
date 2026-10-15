@@ -48,8 +48,14 @@ class _EventLogHandler(logging.Handler):
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="notion-sync", description="Notion 双向同步")
-    # 只列引擎真正实现的命令；设计 §7.5 里的 resolve/forget/rebuild-state 尚未实现
-    p.add_argument("command", choices=["init", "status", "push", "pull", "sync"])
+    # 只列引擎真正实现的命令；设计 §7.5 里的 forget/rebuild-state 尚未实现
+    p.add_argument("command", choices=["init", "status", "push", "pull", "sync", "resolve"])
+    p.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="resolve 的目标路径（相对同步根目录，POSIX 形式）",
+    )
     p.add_argument(
         "--root",
         type=Path,
@@ -62,6 +68,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--full", action="store_true")
     p.add_argument("--expect-plan")
     p.add_argument("--parent-page-id")
+    p.add_argument(
+        "--keep",
+        choices=["local", "remote", "merged"],
+        help="resolve 的裁决：保留本地 / 保留远端 / 已手动合并到本地",
+    )
+    p.add_argument(
+        "--backup-only",
+        action="store_true",
+        help="resolve 只把远端内容落盘成对比用的副本，不做裁决",
+    )
     a = p.parse_args(argv)
 
     cancel = CancelToken()
@@ -102,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         full=a.full,
         expect_plan=a.expect_plan,
         parent_page_id=a.parent_page_id,
+        path=a.path,
+        keep=a.keep,
+        backup_only=a.backup_only,
     )
     return run(a.command, a.root or Path.cwd(), opts, rep, cancel).exit_code
 

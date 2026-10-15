@@ -27,7 +27,14 @@ from sync_lib.canonical import (
 from sync_lib import api, credentials
 from sync_lib.api import RunOptions
 from sync_lib.cancel import CancelToken, Cancelled
-from sync_lib.executor import Summary, _br_from_update_response, execute_plan
+from sync_lib.executor import (
+    ResolveResult,
+    Summary,
+    _br_from_update_response,
+    backup_remote_content,
+    execute_plan,
+    resolve_conflict,
+)
 from sync_lib.lock import LockBusy, RunLock
 from sync_lib.plan import build_plan
 from sync_lib.protocol import (
@@ -1838,13 +1845,18 @@ def test_build_plan_trashed_remote_treated_as_absent():
 class _Args:
     """一次运行的参数命名空间（对齐 api.RunOptions）。"""
 
-    def __init__(self, command, dry_run=False, full=False):
+    def __init__(
+        self, command, dry_run=False, full=False, path=None, keep=None, backup_only=False
+    ):
         self.command = command
         self.dry_run = dry_run
         self.full = full
+        self.path = path
+        self.keep = keep
+        self.backup_only = backup_only
 
 
-def _sync(args, root=None):
+def _sync(args, root=None, reporter=None):
     """按旧 cmd_sync 的用法调用 api.run，返回 RunResult。
 
     编排已从 cli.cmd_sync 搬到 api.run（设计 §7.4），所以这里也换入口。
@@ -1853,12 +1865,18 @@ def _sync(args, root=None):
     from sync_lib.cancel import CancelToken
     from sync_lib.reporter import ConsoleReporter
 
-    opts = RunOptions(dry_run=args.dry_run, full=args.full)
+    opts = RunOptions(
+        dry_run=args.dry_run,
+        full=args.full,
+        path=args.path,
+        keep=args.keep,
+        backup_only=args.backup_only,
+    )
     return run(
         args.command,
         root or Path.cwd(),
         opts,
-        ConsoleReporter(sys.stdout),
+        reporter if reporter is not None else ConsoleReporter(sys.stdout),
         CancelToken(),
     )
 
@@ -2891,3 +2909,649 @@ def test_delete_token_ignores_missing_entry(monkeypatch):
 
     monkeypatch.setattr(credentials.keyring, "delete_password", _raise)
     credentials.delete_token()  # 不该抛
+
+
+# --- executor: resolve（P3，设计 6.5 / 6.6） ---
+
+FORMAT_LF = {
+    "encoding": "utf-8",
+    "bom": False,
+    "eol": "lf",
+    "final_newline": False,
+}
+
+
+def _conflict_mgr(tmp_path, path="a.md", **entry):
+    """建一个已跟踪、处于冲突态的文件条目。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    base = {
+        "page_id": "p1",
+        "block_id": "b1",
+        "format": dict(FORMAT_LF),
+        "status": "conflict",
+    }
+    base.update(entry)
+    mgr.update_file(path, base)
+    return mgr
+
+
+def _write_response(block_id, text):
+    """`blocks.update` 的响应体，供 _br_from_update_response 重算 BR。"""
+    return {
+        "type": "code",
+        "id": block_id,
+        "code": {"rich_text": [{"plain_text": text}]},
+    }
+
+
+# 形态 a：两端都改了
+
+
+def test_resolve_keep_local_pushes_and_backs_up_remote(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(
+        tmp_path,
+        base_local_hash=compute_hash("local v1"),
+        base_remote_hash=compute_hash("remote v1"),
+    )
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b1", True)
+    remote.update_page_content.return_value = _write_response("b1", "local v2")
+
+    result = resolve_conflict(
+        "a.md", "local", mgr, remote, tmp_path, True, True, "p1"
+    )
+
+    assert result.summary.pushed == 1
+    # 本地不动
+    assert (tmp_path / "a.md").read_text() == "local v2"
+    # 覆盖远端前先备份远端原文（设计 6.5 第 5 条）
+    backups = list((tmp_path / ".sync-backup" / "conflicts").glob("a.md.remote-*.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "remote v2"
+    assert result.backup == backups[0].relative_to(tmp_path).as_posix()
+
+    assert remote.update_page_content.call_args[0] == ("p1", "local v2")
+    entry = mgr.get_file("a.md")
+    assert entry["status"] == "synced"
+    assert entry["base_local_hash"] == compute_hash("local v2")
+    assert entry["base_remote_hash"] == compute_hash("local v2")
+
+
+def test_resolve_keep_local_aborts_if_remote_changes_again(tmp_path):
+    """重新定基线不是绕过 6.6：从读远端到写远端之间又变了，照样中止。"""
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(
+        tmp_path,
+        base_local_hash=compute_hash("local v1"),
+        base_remote_hash=compute_hash("remote v1"),
+    )
+
+    remote = Mock()
+    # 第一次读：解决时备份 + 重定基线用；第二次读：_execute_push 的写前校验
+    remote.read_page.side_effect = [
+        ("remote v2", "b1", True),
+        ("remote v3", "b1", True),
+    ]
+
+    with pytest.raises(Exception, match="Remote changed during push"):
+        resolve_conflict("a.md", "local", mgr, remote, tmp_path, True, True, "p1")
+
+    remote.update_page_content.assert_not_called()
+    assert (tmp_path / "a.md").read_text() == "local v2"
+    assert mgr.get_file("a.md")["status"] == "conflict"  # 没解决成功就不放行
+
+
+def test_resolve_keep_remote_pulls_and_backs_up_local(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(
+        tmp_path,
+        base_local_hash=compute_hash("local v1"),
+        base_remote_hash=compute_hash("remote v1"),
+    )
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b2", True)
+
+    result = resolve_conflict(
+        "a.md", "remote", mgr, remote, tmp_path, True, True, "p1"
+    )
+
+    assert result.summary.pulled == 1
+    assert (tmp_path / "a.md").read_text() == "remote v2"
+    backups = list((tmp_path / ".sync-backup" / "overwritten").glob("a.md.*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "local v2"
+
+    entry = mgr.get_file("a.md")
+    assert entry["status"] == "synced"
+    assert entry["base_local_hash"] == compute_hash("remote v2")
+    assert entry["base_remote_hash"] == compute_hash("remote v2")
+    assert entry["block_id"] == "b2"
+
+
+def test_resolve_keep_merged_pushes_local_like_local(tmp_path):
+    (tmp_path / "a.md").write_text("merged result")
+    mgr = _conflict_mgr(tmp_path, base_local_hash="x", base_remote_hash="y")
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b1", True)
+    remote.update_page_content.return_value = _write_response("b1", "merged result")
+
+    result = resolve_conflict(
+        "a.md", "merged", mgr, remote, tmp_path, True, True, "p1"
+    )
+
+    assert result.summary.pushed == 1
+    assert remote.update_page_content.call_args[0] == ("p1", "merged result")
+
+
+# 形态 b：未跟踪，但远端已有同名页且内容不同
+
+
+def test_resolve_keep_local_on_untracked_conflict_seeds_state(tmp_path):
+    """状态里没有这个文件也得能解决：page_id 从远端索引来，补齐 format / block_id。"""
+    (tmp_path / "a.md").write_text("local v2")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b9", True)
+    remote.update_page_content.return_value = _write_response("b9", "local v2")
+
+    result = resolve_conflict(
+        "a.md", "local", mgr, remote, tmp_path, True, True, "p9"
+    )
+
+    assert result.summary.pushed == 1
+    entry = mgr.get_file("a.md")
+    assert entry["page_id"] == "p9"
+    assert entry["block_id"] == "b9"
+    assert entry["format"]["eol"] == "lf"
+    assert entry["status"] == "synced"
+    assert entry["base_local_hash"] == compute_hash("local v2")
+
+
+def test_resolve_keep_remote_on_untracked_conflict(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b9", True)
+
+    result = resolve_conflict(
+        "a.md", "remote", mgr, remote, tmp_path, True, True, "p9"
+    )
+
+    assert result.summary.pulled == 1
+    assert (tmp_path / "a.md").read_text() == "remote v2"
+    # format 没补上 _execute_pull 会 KeyError
+    assert mgr.get_file("a.md")["format"]["eol"] == "lf"
+
+
+# 形态 c：本地删了、远端改了
+
+
+def test_resolve_keep_local_archives_remote(tmp_path):
+    """本地已删 + keep=local = 确认这次删除。"""
+    mgr = _conflict_mgr(tmp_path)
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b1", True)
+
+    result = resolve_conflict(
+        "a.md", "local", mgr, remote, tmp_path, False, True, "p1"
+    )
+
+    assert result.summary.archived == 1
+    remote.archive_page.assert_called_once_with("p1")
+    # 归档后状态条目由 tombstone 取代，不能被 status 复活成空壳
+    assert "a.md" not in mgr.state["files"]
+    assert mgr.state["tombstones"]["a.md"]["page_id"] == "p1"
+    # 覆盖远端前仍然先备份远端原文
+    backups = list((tmp_path / ".sync-backup" / "conflicts").glob("a.md.remote-*.md"))
+    assert backups[0].read_text() == "remote v2"
+
+
+def test_resolve_keep_remote_recreates_deleted_local_file(tmp_path):
+    mgr = _conflict_mgr(tmp_path)
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b1", True)
+
+    result = resolve_conflict(
+        "a.md", "remote", mgr, remote, tmp_path, False, True, "p1"
+    )
+
+    assert result.summary.pulled == 1
+    assert (tmp_path / "a.md").read_text() == "remote v2"
+    assert mgr.get_file("a.md")["status"] == "synced"
+
+
+def test_resolve_merged_rejected_when_local_deleted(tmp_path):
+    mgr = _conflict_mgr(tmp_path)
+
+    with pytest.raises(ValueError, match="没有可合并的本地版本"):
+        resolve_conflict("a.md", "merged", mgr, Mock(), tmp_path, False, True, "p1")
+
+
+# 形态 d：远端删了、本地改了
+
+
+def test_resolve_keep_local_recreates_remote_page(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(tmp_path)
+
+    remote = Mock()
+    remote.create_page.return_value = "p-new"
+    remote.read_page.return_value = ("local v2", "b-new", True)
+
+    result = resolve_conflict(
+        "a.md", "local", mgr, remote, tmp_path, True, False, "p1"
+    )
+
+    assert result.summary.created == 1
+    entry = mgr.get_file("a.md")
+    assert entry["page_id"] == "p-new"
+    assert entry["block_id"] == "b-new"
+    assert entry["status"] == "synced"
+    assert entry["base_local_hash"] == compute_hash("local v2")
+
+
+def test_resolve_keep_remote_deletes_local_file(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(tmp_path)
+
+    result = resolve_conflict(
+        "a.md", "remote", mgr, Mock(), tmp_path, True, False, "p1"
+    )
+
+    assert result.summary.deleted == 1
+    assert not (tmp_path / "a.md").exists()
+    # 覆盖本地前先备份（_execute_delete_local 移进 deleted/）
+    assert (tmp_path / ".sync-backup" / "deleted" / "a.md").read_text() == "local v2"
+    assert "a.md" not in mgr.state["files"]
+    assert mgr.state["tombstones"]["a.md"]["page_id"] == "p1"
+
+
+def test_resolve_merged_rejected_when_remote_deleted(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(tmp_path)
+
+    with pytest.raises(ValueError, match="没有可合并的远端版本"):
+        resolve_conflict("a.md", "merged", mgr, Mock(), tmp_path, True, False, "p1")
+
+
+# 入参校验
+
+
+def test_resolve_rejects_unknown_keep(tmp_path):
+    mgr = _conflict_mgr(tmp_path)
+    with pytest.raises(ValueError, match="unknown keep"):
+        resolve_conflict("a.md", "mine", mgr, Mock(), tmp_path, True, True, "p1")
+
+
+def test_resolve_rejects_when_neither_side_exists(tmp_path):
+    mgr = _conflict_mgr(tmp_path)
+    with pytest.raises(ValueError, match="不是冲突"):
+        resolve_conflict("a.md", "local", mgr, Mock(), tmp_path, False, False, "p1")
+
+
+# --- api: resolve 编排 ---
+
+
+class _EventLog:
+    """只记事件不打印，供断言事件序列。"""
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, type, **data):
+        self.events.append({"type": type, "data": data})
+
+    def types(self):
+        return [e["type"] for e in self.events]
+
+    def first(self, type):
+        return next(e["data"] for e in self.events if e["type"] == type)
+
+
+def _resolve_env(
+    tmp_path,
+    monkeypatch,
+    plan,
+    *,
+    local=("a.md",),
+    state_status="conflict",
+    state_page_id="p1",
+):
+    """搭好 resolve 的编排路径，返回 (mocks, remote)。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    files = {}
+    if state_page_id:
+        files["a.md"] = {
+            "page_id": state_page_id,
+            "block_id": "b1",
+            "base_local_hash": "L0",
+            "base_remote_hash": "R0",
+            "format": dict(FORMAT_LF),
+            "status": state_status,
+        }
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": files,
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    mocks, remote = _patch_pipeline(monkeypatch, plan)
+    # 本地快照决定 local_exists；_patch_pipeline 默认给空快照
+    monkeypatch.setattr(
+        api, "scan_local", Mock(return_value=_snapshot({p: "L" for p in local}))
+    )
+    return mocks, remote
+
+
+def _run_resolve(monkeypatch, *, return_value=None, side_effect=None, **args):
+    """替换 api.resolve_conflict 后跑一次 resolve，返回 (result, mock, log)。"""
+    mock = Mock(return_value=return_value, side_effect=side_effect)
+    monkeypatch.setattr(api, "resolve_conflict", mock)
+
+    log = _EventLog()
+    kwargs = {"path": "a.md", "keep": "local"}
+    kwargs.update(args)
+    result = _sync(_Args("resolve", **kwargs), reporter=log)
+    return result, mock, log
+
+
+def test_resolve_requires_path(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    result, mock, log = _run_resolve(monkeypatch, path=None)
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "no-path"
+    mock.assert_not_called()
+
+
+def test_resolve_requires_keep(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    result, mock, log = _run_resolve(monkeypatch, keep=None)
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "no-keep"
+    mock.assert_not_called()
+
+
+def test_resolve_rejects_non_conflict_row(tmp_path, monkeypatch):
+    """状态是 synced、计划里是 PUSH 的项不该走 resolve。"""
+    _resolve_env(
+        tmp_path,
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH)},
+        state_status="synced",
+    )
+    result, mock, log = _run_resolve(monkeypatch)
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "not-conflict"
+    assert "file.started" not in log.types()
+    mock.assert_not_called()
+
+
+def test_resolve_unknown_path(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    result, mock, log = _run_resolve(monkeypatch, path="nope.md")
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "not-in-plan"
+
+
+def test_resolve_accepts_blocked_row_whose_status_is_conflict(tmp_path, monkeypatch):
+    """已标 conflict 的项会再被分类成 BLOCKED，仍然允许解决（幂等重试）。"""
+    _resolve_env(
+        tmp_path,
+        monkeypatch,
+        {"a.md": Classification(Action.BLOCKED, "conflict status")},
+    )
+    outcome = ResolveResult(Summary(errors=[]), None)
+    result, mock, log = _run_resolve(monkeypatch, return_value=outcome)
+
+    assert result.exit_code == EXIT.OK
+    mock.assert_called_once()
+
+
+def test_resolve_merged_rejected_when_only_one_side(tmp_path, monkeypatch):
+    _resolve_env(
+        tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)}, local=()
+    )
+    result, mock, log = _run_resolve(monkeypatch, keep="merged")
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "bad-keep"
+    mock.assert_not_called()
+
+
+def test_resolve_emits_full_event_sequence(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+
+    outcome = ResolveResult(Summary(errors=[]), "backup/a.md.remote-x.md")
+    outcome.summary.pushed = 1
+
+    result, mock, log = _run_resolve(monkeypatch, return_value=outcome)
+
+    assert result.exit_code == EXIT.OK
+    assert result.summary["pushed"] == 1
+
+    types = log.types()
+    # 界面靠 plan 事件刷新计划表，靠 file.* 定位到行
+    assert "plan" in types
+    assert types.index("file.started") < types.index("file.finished")
+    assert types[-1] == "run.finished"
+    assert log.events[-1]["data"]["executed"] is True
+
+    assert log.first("file.started")["action"] == "RESOLVE"
+    assert log.first("file.finished")["result"] == "ok"
+    assert log.first("progress") == {"done": 1, "total": 1}
+
+    message = log.first("log")["message"]
+    assert "已解决" in message
+    assert "保留本地" in message
+    assert "备份到 backup/a.md.remote-x.md" in message  # 放弃的那侧去了哪儿要说清
+
+    mock.assert_called_once()
+    assert mock.call_args[0][1] == "local"
+
+
+def test_resolve_passes_local_and_remote_existence(tmp_path, monkeypatch):
+    """两侧是否存在由编排层判定后传下去，executor 不再自己探。"""
+    _resolve_env(
+        tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)}, local=()
+    )
+    outcome = ResolveResult(Summary(errors=[]), None)
+    result, mock, log = _run_resolve(monkeypatch, return_value=outcome, keep="remote")
+
+    assert result.exit_code == EXIT.OK
+    args = mock.call_args[0]
+    assert args[0] == "a.md"
+    assert args[5] is False  # local_exists
+    assert args[6] is True  # remote_exists（state 里带 page_id，视为 R == BR）
+    assert args[7] == "p1"
+
+
+def test_resolve_merged_message_says_merged(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    outcome = ResolveResult(Summary(errors=[]), None)
+
+    result, mock, log = _run_resolve(monkeypatch, return_value=outcome, keep="merged")
+
+    assert result.exit_code == EXIT.OK
+    assert "保留合并后的本地" in log.first("log")["message"]
+
+
+def test_resolve_failure_is_exit_1_with_file_finished(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+
+    result, mock, log = _run_resolve(
+        monkeypatch, side_effect=Exception("Remote changed during push")
+    )
+
+    assert result.exit_code == EXIT.FAILED
+    assert result.summary["failed"] == 1
+    finished = log.first("file.finished")
+    assert finished["result"] == "failed"
+    assert "Remote changed" in finished["error"]
+
+
+def test_cli_parses_resolve_path_and_keep(tmp_path, monkeypatch):
+    from sync_lib import cli
+    from sync_lib.api import RunResult
+
+    captured = {}
+
+    def _fake_run(command, root, opts, rep, cancel):
+        captured["command"] = command
+        captured["path"] = opts.path
+        captured["keep"] = opts.keep
+        return RunResult(EXIT.OK, {})
+
+    monkeypatch.setattr(cli, "run", _fake_run)
+    code = cli.main(
+        ["resolve", "docs/a.md", "--keep", "remote", "--root", str(tmp_path)]
+    )
+
+    assert code == EXIT.OK
+    assert captured == {"command": "resolve", "path": "docs/a.md", "keep": "remote"}
+
+
+def test_cli_resolve_keep_rejects_unknown_value(tmp_path):
+    from sync_lib import cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["resolve", "a.md", "--keep", "mine", "--root", str(tmp_path)])
+
+
+# --- backup-only：只落远端副本，供界面做对比（设计 §226） ---
+
+
+def test_backup_remote_content_writes_copy_and_leaves_state_alone(tmp_path):
+    (tmp_path / "a.md").write_text("local v2")
+    mgr = _conflict_mgr(tmp_path)
+    before = json.loads(json.dumps(mgr.state["files"]))
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v2", "b1", True)
+
+    backup = backup_remote_content("a.md", remote, tmp_path, "p1")
+
+    assert backup.read_text() == "remote v2"
+    assert backup.parent == tmp_path / ".sync-backup" / "conflicts"
+    # 只看不裁决：状态一个字节都不动
+    assert mgr.state["files"] == before
+    remote.update_page_content.assert_not_called()
+    remote.archive_page.assert_not_called()
+    remote.create_page.assert_not_called()
+
+
+def test_backup_remote_content_rejects_invalid_structure(tmp_path):
+    remote = Mock()
+    remote.read_page.return_value = ("", "b1", False)
+
+    with pytest.raises(Exception, match="remote invalid-structure"):
+        backup_remote_content("a.md", remote, tmp_path, "p1")
+
+    assert not (tmp_path / ".sync-backup").exists()
+
+
+def test_run_backup_only_writes_copy_without_resolving(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    monkeypatch.setattr(api, "resolve_conflict", Mock())
+    target = tmp_path / ".sync-backup" / "conflicts" / "a.md.remote-x.md"
+    monkeypatch.setattr(api, "backup_remote_content", Mock(return_value=target))
+
+    log = _EventLog()
+    result = _sync(_Args("resolve", path="a.md", backup_only=True), reporter=log)
+
+    assert result.exit_code == EXIT.OK
+    assert log.first("file.started")["action"] == "BACKUP"
+    assert log.first("file.finished")["result"] == "ok"
+    assert ".sync-backup/conflicts/a.md.remote-x.md" in log.first("log")["message"]
+    api.resolve_conflict.assert_not_called()
+    api.backup_remote_content.assert_called_once()
+
+
+def test_run_backup_only_rejects_keep(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    monkeypatch.setattr(api, "backup_remote_content", Mock())
+
+    log = _EventLog()
+    result = _sync(
+        _Args("resolve", path="a.md", keep="local", backup_only=True), reporter=log
+    )
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "bad-flags"
+    api.backup_remote_content.assert_not_called()
+
+
+def test_run_backup_only_requires_remote_page(tmp_path, monkeypatch):
+    """形态 d（远端已删）没有远端副本可拿。"""
+    _resolve_env(
+        tmp_path,
+        monkeypatch,
+        {"a.md": Classification(Action.CONFLICT)},
+        state_page_id=None,
+    )
+    monkeypatch.setattr(api, "backup_remote_content", Mock())
+
+    log = _EventLog()
+    result = _sync(_Args("resolve", path="a.md", backup_only=True), reporter=log)
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "no-remote"
+    api.backup_remote_content.assert_not_called()
+
+
+def test_run_backup_only_failure_is_exit_1(tmp_path, monkeypatch):
+    _resolve_env(tmp_path, monkeypatch, {"a.md": Classification(Action.CONFLICT)})
+    monkeypatch.setattr(
+        api,
+        "backup_remote_content",
+        Mock(side_effect=Exception("remote invalid-structure")),
+    )
+
+    log = _EventLog()
+    result = _sync(_Args("resolve", path="a.md", backup_only=True), reporter=log)
+
+    assert result.exit_code == EXIT.FAILED
+    assert result.summary["failed"] == 1
+    assert log.first("file.finished")["result"] == "failed"
+
+
+def test_cli_parses_backup_only(tmp_path, monkeypatch):
+    from sync_lib import cli
+    from sync_lib.api import RunResult
+
+    captured = {}
+
+    def _fake_run(command, root, opts, rep, cancel):
+        captured["path"] = opts.path
+        captured["backup_only"] = opts.backup_only
+        captured["keep"] = opts.keep
+        return RunResult(EXIT.OK, {})
+
+    monkeypatch.setattr(cli, "run", _fake_run)
+    code = cli.main(["resolve", "docs/a.md", "--backup-only", "--root", str(tmp_path)])
+
+    assert code == EXIT.OK
+    assert captured == {"path": "docs/a.md", "backup_only": True, "keep": None}

@@ -137,7 +137,6 @@ def test_init_without_parent_page_warns(ui, tmp_path):
         ("syncButton", "sync", ()),
         ("pushButton", "push", ()),
         ("pullButton", "pull", ()),
-        ("previewButton", "sync", ("--dry-run",)),
     ],
 )
 def test_buttons_map_to_commands(ui, tmp_path, button, command, flags):
@@ -146,6 +145,19 @@ def test_buttons_map_to_commands(ui, tmp_path, button, command, flags):
     page.set_folder(folder)
     getattr(page, button).click()
     assert engine.starts == [(command, folder, flags)]
+
+
+def test_preview_button_asks_for_the_plan_page(ui, tmp_path):
+    """「预览计划」不再自己跑命令，交给计划页（P3 的预览→执行闭环）。"""
+    page, engine, _ = ui
+    page.set_folder(make_folder(tmp_path))
+    fired = []
+    page.previewRequested.connect(lambda: fired.append(True))
+
+    page.previewButton.click()
+
+    assert fired == [True]
+    assert engine.starts == []
 
 
 def test_run_remembers_folder_and_clears_log(ui, tmp_path):

@@ -61,6 +61,8 @@ class SyncPage(FolderDropArea):
 
     # 需要跳到设置页（比如没 token）时发出
     openSettingsRequested = Signal()
+    # 「预览计划」不再自己跑命令：切到计划页由它去 `status`（P3）
+    previewRequested = Signal()
 
     def __init__(self, engine: EngineClient, parent=None):
         super().__init__(parent)
@@ -191,8 +193,7 @@ class SyncPage(FolderDropArea):
         self.syncButton.clicked.connect(lambda: self.run("sync"))
         self.pushButton.clicked.connect(lambda: self.run("push"))
         self.pullButton.clicked.connect(lambda: self.run("pull"))
-        # 「预览计划」= sync --dry-run：只出计划，不执行
-        self.previewButton.clicked.connect(lambda: self.run("sync", "--dry-run"))
+        self.previewButton.clicked.connect(self.previewRequested.emit)
         self.cancelButton.clicked.connect(self.engine.cancel)
 
     # ------------------------------------------------------------ 用户动作
@@ -314,7 +315,13 @@ class SyncPage(FolderDropArea):
         return self.folderEdit.text().strip()
 
     def _info(self, title: str, content: str) -> None:
-        InfoBar.info(title, content, parent=self, position=InfoBarPosition.TOP_RIGHT, duration=4000)
+        InfoBar.info(
+            title, content, parent=self.window(), position=InfoBarPosition.TOP_RIGHT, duration=4000
+        )
 
     def _warn(self, title: str, content: str) -> None:
-        InfoBar.warning(title, content, parent=self, position=InfoBarPosition.TOP_RIGHT, duration=6000)
+        # 挂在顶层窗口上而不是本页：计划页发起的命令也走这里，
+        # 提示条跟着页面一起藏起来就白提示了。
+        InfoBar.warning(
+            title, content, parent=self.window(), position=InfoBarPosition.TOP_RIGHT, duration=6000
+        )

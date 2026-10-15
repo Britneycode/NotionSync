@@ -21,7 +21,12 @@ from notion_client import Client
 from .cancel import CancelToken, Cancelled
 from .canonical import compute_hash, normalize_path
 from .credentials import get_token
-from .executor import Summary, execute_plan
+from .executor import (
+    Summary,
+    backup_remote_content,
+    execute_plan,
+    resolve_conflict,
+)
 from .lock import LockBusy, RunLock
 from .plan import build_plan
 from .planner import Action
@@ -67,14 +72,17 @@ class SyncError(Exception):
 class RunOptions:
     """一次运行的开关。只放引擎真正会读的项。
 
-    刻意不含 `adopt_remote / paths / keep`：那几项属于设计 §7.5 里的 `resolve`
-    命令，而该命令在引擎里并不存在，加了就是死占位符。
+    刻意不含 `adopt_remote / paths`：那几项属于设计 §7.5 里尚未实现的命令，
+    加了就是死占位符。`path` / `keep` / `backup_only` 只服务于 `resolve`（P3 起真实存在）。
     """
 
     dry_run: bool = False
     full: bool = False
     expect_plan: str | None = None
     parent_page_id: str | None = None
+    path: str | None = None  # resolve 的目标
+    keep: str | None = None  # resolve 的裁决：local / remote / merged
+    backup_only: bool = False  # resolve 只落远端副本，不做裁决
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +90,9 @@ class RunOptions:
             "full": self.full,
             "expect_plan": self.expect_plan,
             "parent_page_id": self.parent_page_id,
+            "path": self.path,
+            "keep": self.keep,
+            "backup_only": self.backup_only,
         }
 
 
@@ -173,6 +184,11 @@ def run(
 
             if command == "status" or opts.dry_run:
                 return _finish(rep, EXIT.OK, summary, started_at)
+
+            if command == "resolve":
+                return _run_resolve(
+                    ctx, plan, local_snapshot, remote_index, opts, rep, summary, started_at
+                )
 
             if opts.expect_plan and opts.expect_plan != fingerprint:
                 rep.emit(
@@ -304,6 +320,132 @@ def _run_init(
         return _finish(rep, EXIT.FATAL, summary, started_at)
 
     return _finish(rep, EXIT.OK, summary, started_at)
+
+
+_KEEP_LABELS = {"local": "本地", "remote": "远端", "merged": "合并后的本地"}
+
+
+def _run_resolve(
+    ctx: _Context,
+    plan: dict,
+    local_snapshot,
+    remote_index: dict,
+    opts: RunOptions,
+    rep: Reporter,
+    summary: dict,
+    started_at: float,
+) -> RunResult:
+    """解决一个冲突项（设计 6.5 / 6.6）；`--backup-only` 时只落远端副本。
+
+    先按正常流程重新分类（所以 `resolve` 也会发出完整的 `plan` 事件，界面据此
+    刷新计划表），再校验目标确实处于冲突态，最后交给 `resolve_conflict`。
+    """
+    path = opts.path
+    if not path:
+        raise SyncError("resolve 需要指定要解决的路径", code="no-path")
+    if opts.backup_only and opts.keep:
+        raise SyncError("--backup-only 与 --keep 不能同时使用", code="bad-flags")
+    if not opts.backup_only and opts.keep not in _KEEP_LABELS:
+        raise SyncError("resolve 需要 --keep local|remote|merged", code="no-keep")
+
+    classification = plan.get(path)
+    if classification is None:
+        raise SyncError(f"{path} 不在当前计划里", code="not-in-plan")
+    # 已经解决过、状态仍是 conflict 的项会被分类成 BLOCKED，所以两种都接受；
+    # 但 BLOCKED 里还有"远端结构异常"，那种不是冲突，不能放行。
+    if (
+        classification.action != Action.CONFLICT
+        and ctx.state.get_file(path).get("status") != "conflict"
+    ):
+        raise SyncError(
+            f"{path} 当前不是冲突（{classification.action.name}），无需解决",
+            code="not-conflict",
+        )
+
+    local_exists = path in local_snapshot.files
+    remote_exists = path in remote_index
+    page_id = ctx.state.get_file(path).get("page_id") or (
+        remote_index[path]["page_id"] if remote_exists else None
+    )
+
+    if opts.backup_only:
+        if not remote_exists:
+            raise SyncError(
+                f"{path}: 远端没有这个页面，没有可对比的远端副本", code="no-remote"
+            )
+        return _run_backup_only(ctx, path, page_id, rep, summary, started_at)
+
+    if opts.keep == "merged" and not (local_exists and remote_exists):
+        raise SyncError(
+            f"{path} 两侧不是都有文件，没有可合并的版本", code="bad-keep"
+        )
+
+    rep.emit("phase", name="execute")
+    rep.emit("file.started", path=path, action="RESOLVE", index=1, total=1)
+    try:
+        result = resolve_conflict(
+            path,
+            opts.keep,
+            ctx.state,
+            ctx.remote,
+            ctx.root,
+            local_exists,
+            remote_exists,
+            page_id,
+        )
+    except Exception as e:
+        summary["failed"] += 1
+        rep.emit(
+            "file.finished",
+            path=path,
+            action="RESOLVE",
+            result="failed",
+            status="",
+            error=str(e),
+        )
+        return _finish(rep, EXIT.FAILED, summary, started_at, executed=True)
+
+    _merge(summary, result.summary)
+    rep.emit(
+        "file.finished", path=path, action="RESOLVE", result="ok", status="", error=None
+    )
+    rep.emit("progress", done=1, total=1)
+
+    message = f"已解决：{path}（保留{_KEEP_LABELS[opts.keep]}）"
+    if result.backup:
+        message += f"，放弃的一侧已备份到 {result.backup}"
+    rep.emit("log", level="info", message=message)
+    return _finish(rep, EXIT.OK, summary, started_at, executed=True)
+
+
+def _run_backup_only(ctx, path, page_id, rep, summary, started_at):
+    """`--backup-only`：只把远端内容落盘成对比用的副本，不改状态、不做裁决。"""
+    rep.emit("phase", name="execute")
+    rep.emit("file.started", path=path, action="BACKUP", index=1, total=1)
+    try:
+        backup = backup_remote_content(path, ctx.remote, ctx.root, page_id)
+    except Exception as e:
+        summary["failed"] += 1
+        rep.emit(
+            "file.finished",
+            path=path,
+            action="BACKUP",
+            result="failed",
+            status="",
+            error=str(e),
+        )
+        return _finish(rep, EXIT.FAILED, summary, started_at, executed=True)
+
+    rep.emit(
+        "file.finished", path=path, action="BACKUP", result="ok", status="", error=None
+    )
+    rep.emit("progress", done=1, total=1)
+    rep.emit(
+        "log",
+        level="info",
+        message=f"远端副本已写入 {backup.relative_to(ctx.root).as_posix()}",
+    )
+    return _finish(rep, EXIT.OK, summary, started_at, executed=True)
 
 
 def _load_context(
