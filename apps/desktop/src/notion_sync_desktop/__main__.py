@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
 from .pages.settings_page import apply_theme
+from .services.app_icon import app_icon
 from .services.notion_theme import install as install_notion_theme
 from .services.settings import UiSettings
 from .services.single_instance import SingleInstance, server_name
@@ -45,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv)
     app.setApplicationName("NotionSync")
     app.setApplicationDisplayName("Notion 同步")
+    # 窗口图标要自己设：exe 里嵌的那份只给资源管理器看，窗口和任务栏走的是
+    # WM_SETICON，不设就是 Windows 的通用图标
+    app.setWindowIcon(app_icon())
     # 主题得在控件构造之前定：Fluent 的组件在构造时就把当前亮暗读进去了
     theme = UiSettings().theme
     apply_theme(theme)

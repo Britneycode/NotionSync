@@ -22,6 +22,7 @@ from .pages.history_page import HistoryPage
 from .pages.plan_page import PlanPage
 from .pages.settings_page import SettingsPage
 from .pages.sync_page import EXIT_LABELS, SyncPage
+from .services.app_icon import app_icon
 from .services.history import HistoryWriter
 
 
@@ -141,7 +142,8 @@ class MainWindow(FluentWindow):
         if not tray_available():
             self.tray = None
             return
-        self.tray = QSystemTrayIcon(FIF.SYNC.icon(), self)
+        # 用应用自己的图标：托盘是程序在桌面上的「常驻面孔」，跟窗口图标一致
+        self.tray = QSystemTrayIcon(app_icon(), self)
         self.tray.setToolTip("Notion 同步")
         menu = SystemTrayMenu(parent=self)
         menu.addActions(

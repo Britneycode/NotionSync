@@ -19,12 +19,17 @@ ROOT = Path(SPECPATH).parent
 DESKTOP_SRC = ROOT / "apps" / "desktop" / "src"
 ENGINE_SRC = ROOT / "packages" / "notion-sync-engine" / "src"
 PACKAGING = ROOT / "packaging"
-ICON = str(DESKTOP_SRC / "notion_sync_desktop" / "resources" / "icon.ico")
+RESOURCES = DESKTOP_SRC / "notion_sync_desktop" / "resources"
+ICON = str(RESOURCES / "icon.ico")
 
 # 两个 src 根都显式给出：editable 安装靠 .pth 也能找到，但不依赖它更稳
 pathex = [str(DESKTOP_SRC), str(ENGINE_SRC)]
 
-gui = Analysis([str(PACKAGING / "gui_entry.py")], pathex=pathex)
+# 图标同时要作为**数据文件**带上：exe 里嵌的那份给资源管理器看，窗口与任务栏
+# 走的是 `app.setWindowIcon()` 读的这份（见 __main__.icon_path）。只有界面需要。
+gui_datas = [(str(RESOURCES / "icon.ico"), "notion_sync_desktop/resources")]
+
+gui = Analysis([str(PACKAGING / "gui_entry.py")], pathex=pathex, datas=gui_datas)
 engine = Analysis([str(PACKAGING / "engine_entry.py")], pathex=pathex)
 
 gui_pyz = PYZ(gui.pure)

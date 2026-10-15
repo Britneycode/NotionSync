@@ -11,6 +11,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QSystemTrayIcon, QWidget
 
 from notion_sync_desktop import main_window as mw
+from notion_sync_desktop.services.app_icon import app_icon
 from notion_sync_desktop.services.settings import UiSettings
 
 
@@ -343,6 +344,13 @@ def test_tray_resident_window_keeps_running(tray_window):
 
     win.show_window()
     assert win.isVisible()
+
+
+def test_tray_shows_the_app_icon(tray_window):
+    """托盘是程序在桌面上的常驻面孔，得跟窗口图标一致，而不是 Fluent 的通用字形。"""
+    win, _, _ = tray_window
+
+    assert win.tray.icon().pixmap(32, 32).toImage() == app_icon().pixmap(32, 32).toImage()
 
 
 def test_tray_menu_offers_sync_window_and_quit(tray_window):
