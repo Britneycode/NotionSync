@@ -29,6 +29,17 @@ def folder_argument(argv: list[str]) -> str:
     return ""
 
 
+def start_hidden(argv: list[str], has_tray: bool) -> bool:
+    """这次启动要不要直接待在托盘里（不弹窗）。
+
+    `--tray` 是安装包「开机自启」那条用的：登录时弹个窗口出来很烦。没有托盘的
+    环境不能藏——藏了就再没有入口把它叫出来（托盘菜单是唯一的门），照常显示。
+
+    单独抽成函数是为了让测试能选分支，跟 `main_window.tray_available()` 一个路数。
+    """
+    return "--tray" in argv[1:] and has_tray
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
@@ -53,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
 
     instance.messageReceived.connect(on_message)
     instance.listen()  # 抢不到监听口也不影响用，只是没有单实例
-    win.show()
+    if not start_hidden(argv, win.tray is not None):
+        win.show()
     if folder:
         win.sync_page.set_folder(folder)
     # 有托盘时关掉窗口不该结束进程（同步还在托盘后面跑）

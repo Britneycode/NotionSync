@@ -103,3 +103,20 @@ def test_folder_argument_picks_the_first_existing_directory(tmp_path):
 def test_folder_argument_is_empty_without_a_directory():
     assert entry.folder_argument(["app.exe", "--theme", "dark"]) == ""
     assert entry.folder_argument(["app.exe"]) == ""
+
+
+def test_tray_flag_starts_hidden():
+    assert entry.start_hidden(["app.exe", "--tray"], has_tray=True)
+
+
+def test_window_shows_without_the_tray_flag():
+    assert not entry.start_hidden(["app.exe"], has_tray=True)
+
+
+def test_tray_flag_can_come_with_a_folder_argument():
+    assert entry.start_hidden(["app.exe", "--tray", "D:\\some\\folder"], has_tray=True)
+
+
+def test_tray_flag_falls_back_to_showing_without_a_tray():
+    """藏起来又没托盘 = 再也叫不出来，所以这种环境必须显示窗口。"""
+    assert not entry.start_hidden(["app.exe", "--tray"], has_tray=False)
