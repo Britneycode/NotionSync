@@ -15,10 +15,6 @@ notion-sync-desktop = "notion_sync_desktop.__main__:main"
 [tool.uv.sources]
 notion-sync-engine = { workspace = true }
 
-[dependency-groups]
-# pytest-qt 在根 dev 组（plain `uv sync` 才会装）；这里只留打包期才需要的
-dev = ["pyinstaller>=6.6"]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

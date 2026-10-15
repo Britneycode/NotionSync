@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
 from .pages.settings_page import apply_theme
+from .services.notion_theme import install as install_notion_theme
 from .services.settings import UiSettings
 from .services.single_instance import SingleInstance, server_name
 
@@ -33,7 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv)
     app.setApplicationName("NotionSync")
     app.setApplicationDisplayName("Notion 同步")
-    apply_theme(UiSettings().theme)
+    # 主题得在控件构造之前定：Fluent 的组件在构造时就把当前亮暗读进去了
+    theme = UiSettings().theme
+    apply_theme(theme)
 
     folder = folder_argument(argv)
     instance = SingleInstance(server_name(), parent=app)
@@ -41,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # 已经有一个窗口在跑，参数交给它了，这边直接退
 
     win = MainWindow()
+    install_notion_theme(win, theme)  # 窗口底色要拿到窗口对象才能设
 
     def on_message(message: dict) -> None:
         if message.get("folder"):

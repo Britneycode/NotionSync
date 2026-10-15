@@ -21,14 +21,13 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     SubtitleLabel,
-    Theme,
-    setTheme,
 )
 
 import sync_lib
 from sync_lib import credentials
 from sync_lib.protocol import PROTOCOL_VERSION
 
+from ..services.notion_theme import apply_theme as _apply_notion_theme
 from ..services.settings import UiSettings
 
 SOURCE_LABELS = {
@@ -39,12 +38,11 @@ SOURCE_LABELS = {
 
 # 主题下拉的显示名 → 存进 UiSettings 的值
 THEME_ITEMS = {"跟随系统": "auto", "浅色": "light", "深色": "dark"}
-_THEME_VALUES = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
 
 
 def apply_theme(name: str) -> None:
     """应用存下来的主题名；认不出来就当「跟随系统」。"""
-    setTheme(_THEME_VALUES.get(name, Theme.AUTO))
+    _apply_notion_theme(name)
 
 
 class _TokenSaver(QThread):

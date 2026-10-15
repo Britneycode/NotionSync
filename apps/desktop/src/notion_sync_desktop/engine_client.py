@@ -15,11 +15,13 @@ from sync_lib.protocol import PROTOCOL_VERSION
 def engine_command() -> tuple[str, list[str]]:
     """返回 (可执行文件, 前置参数)。
 
-    打包后同目录下放着一个控制台版 `notion-sync.exe`，直接调它；
+    打包后同目录下有**两个**引擎：`notion-sync.exe`（控制台，命令行用）和
+    `notion-sync-engine.exe`（窗口版）。界面拿后者——界面自己没有控制台，拉起
+    控制台程序会被 Windows 新分配一个控制台，每次同步闪一个黑框。见 DECISIONS。
     开发模式用当前解释器跑模块，省得先装一遍命令行入口。
     """
     if getattr(sys, "frozen", False):
-        return str(Path(sys.executable).with_name("notion-sync.exe")), []
+        return str(Path(sys.executable).with_name("notion-sync-engine.exe")), []
     return sys.executable, ["-m", "sync_lib.cli"]
 
 
@@ -60,7 +62,7 @@ class EngineClient(QObject):
             [*base, command, "--root", root, "--json", "--control-stdin", *flags]
         )
         # 子进程会不会弹控制台窗口：开发模式下它继承启动界面的那个终端，不会弹；
-        # 打包成无控制台的 GUI exe 之后才会，那是 P5 打包要解决的事（见 DECISIONS）。
+        # 打包后界面拉的是同目录的窗口版引擎（engine_command），也不会弹。
         proc.readyReadStandardOutput.connect(self._on_stdout)
         proc.readyReadStandardError.connect(self._on_stderr)
         proc.finished.connect(self._on_finished)

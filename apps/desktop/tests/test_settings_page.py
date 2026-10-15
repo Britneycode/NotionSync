@@ -15,7 +15,7 @@ def page(tmp_path, qtbot, monkeypatch):
     monkeypatch.setattr(mod, "UiSettings", lambda: settings)
     monkeypatch.setattr(mod.credentials, "get_token", lambda: (None, "none"))
     applied: list[str] = []
-    monkeypatch.setattr(mod, "setTheme", lambda theme: applied.append(theme.name))
+    monkeypatch.setattr(mod, "apply_theme", lambda theme: applied.append(theme))
     folder = tmp_path / "ready"
     folder.mkdir()
     widget = mod.SettingsPage(lambda: str(folder))
@@ -39,7 +39,7 @@ def test_theme_change_is_saved_and_applied(page, tmp_path):
     widget.themeCombo.setCurrentIndex(2)  # 深色
 
     assert settings.theme == "dark"
-    assert applied == ["DARK"]
+    assert applied == ["dark"]
     # 落盘了：换一个实例读回来还是它
     assert UiSettings(tmp_path / "settings.json").theme == "dark"
 

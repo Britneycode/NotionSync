@@ -96,11 +96,13 @@ def test_engine_command_uses_module_in_dev_mode(monkeypatch):
     assert base == ["-m", "sync_lib.cli"]
 
 
-def test_engine_command_prefers_sibling_exe_when_frozen(monkeypatch, tmp_path):
+def test_engine_command_prefers_windowed_sibling_when_frozen(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "NotionSync.exe"))
     program, base = engine_client.engine_command()
-    assert program == str(tmp_path / "notion-sync.exe")
+    # 窗口版（不是同目录那个控制台的 notion-sync.exe）：界面没控制台，拉控制台
+    # 程序会闪黑框。见 DECISIONS
+    assert program == str(tmp_path / "notion-sync-engine.exe")
     assert base == []
 
 

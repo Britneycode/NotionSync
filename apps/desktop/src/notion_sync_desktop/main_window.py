@@ -35,7 +35,6 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.setWindowTitle("Notion 同步")
         self.resize(1080, 720)
-        self.setMicaEffectEnabled(True)  # Win10 上会自动降级为纯色
 
         self._quitting = False
         self._tray_hint_shown = False

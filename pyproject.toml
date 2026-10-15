@@ -18,8 +18,10 @@ members = ["packages/*", "apps/*"]
 
 # 全 workspace 共用的开发工具
 # 放在根组里，plain `uv sync` 才会装（成员包自己的 dev 组默认不装，见 DECISIONS）
+# pyinstaller 同理放这里：`uv sync` 是精确同步，成员作用域的一次 sync 会把根组
+# 卸掉（实测 pytest 与 pyinstaller 互相驱逐），两套工具必须待在同一个组里
 [dependency-groups]
-dev = ["pytest>=8", "pytest-qt>=4.4"]
+dev = ["pytest>=8", "pytest-qt>=4.4", "pyinstaller>=6.6"]
 
 # 在仓库根跑 `uv run pytest` 就把两个包的测试都带上
 [tool.pytest.ini_options]
