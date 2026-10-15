@@ -11,6 +11,9 @@ from platformdirs import user_config_dir
 
 APP_NAME = "NotionSync"
 
+THEMES = ("auto", "light", "dark")
+DEFAULT_THEME = "auto"
+
 
 def config_path() -> Path:
     return Path(user_config_dir(APP_NAME)) / "settings.json"
@@ -31,9 +34,15 @@ class UiSettings:
         return data if isinstance(data, dict) else {}
 
     def save(self) -> None:
+        """写之前先把磁盘上的读回来合并。
+
+        同步页、设置页各持一个实例，都只记得自己构造时的快照；直接整份覆盖
+        会让后写的那个把前一个刚存的键抹掉（比如改主题把「上次的文件夹」冲掉）。
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        merged = {**self._read(), **self._data}
         self._path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
     @property
@@ -45,4 +54,41 @@ class UiSettings:
     @last_folder.setter
     def last_folder(self, value: str) -> None:
         self._data["last_folder"] = value
+        self.save()
+
+    @property
+    def bookmarks(self) -> list[str]:
+        """常用文件夹。已经不在的路径不列出来（跟 `last_folder` 一个口径）。"""
+        items = self._data.get("bookmarks")
+        if not isinstance(items, list):
+            return []
+        return [p for p in items if isinstance(p, str) and Path(p).is_dir()]
+
+    def add_bookmark(self, folder: str) -> bool:
+        """加一个书签；已经在里面就返回 False。新加的排最前。"""
+        folder = folder.strip()
+        if not folder:
+            return False
+        items = self._data.get("bookmarks")
+        items = items if isinstance(items, list) else []
+        if folder in items:
+            return False
+        self._data["bookmarks"] = [folder, *items]
+        self.save()
+        return True
+
+    def remove_bookmark(self, folder: str) -> None:
+        items = self._data.get("bookmarks")
+        if isinstance(items, list) and folder in items:
+            self._data["bookmarks"] = [p for p in items if p != folder]
+            self.save()
+
+    @property
+    def theme(self) -> str:
+        value = self._data.get("theme")
+        return value if value in THEMES else DEFAULT_THEME
+
+    @theme.setter
+    def theme(self, value: str) -> None:
+        self._data["theme"] = value if value in THEMES else DEFAULT_THEME
         self.save()
