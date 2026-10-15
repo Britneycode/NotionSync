@@ -5,10 +5,11 @@
 映射回源行——右键菜单要拿的正是源行。
 """
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor
 
 COLUMNS = [
+    ("checked", ""),  # 勾选列：像文件管理器那样挑要执行的行
     ("action", "动作"),
     ("path", "路径"),
     ("local", "本地"),
@@ -48,6 +49,9 @@ FILTER_GROUPS: dict[str, frozenset[str] | None] = {
     "全部": None,
 }
 
+# 能勾选的行：就是「待处理」那些真会动手的动作。其余行（跳过、冲突）勾了也没意义。
+CHECKABLE_ACTIONS = FILTER_GROUPS["待处理"]
+
 # 引擎给的是短标签（protocol.side_label），表格里换成中文
 SIDE_LABELS = {"absent": "无", "new": "新建", "same": "相同", "changed": "已改"}
 RESULT_LABELS = {"ok": "成功", "failed": "失败", "skipped": "跳过", "blocked": "阻塞"}
@@ -56,6 +60,9 @@ PENDING_LABEL = "待执行"
 
 class PlanTableModel(QAbstractTableModel):
     """计划行；`fingerprint` 是「执行此计划」要带回去的乐观校验依据。"""
+
+    # 勾选状态变了（含「全选」）：页面据此刷新按钮
+    checkedChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,10 +73,20 @@ class PlanTableModel(QAbstractTableModel):
     # ------------------------------------------------------------ 数据装载
 
     def set_plan(self, fingerprint: str, rows: list[dict]) -> None:
-        """整表替换。SKIP 行也留着——「无需处理」分段要看得见它们。"""
+        """整表替换。SKIP 行也留着——「无需处理」分段要看得见它们。
+
+        可勾选的行默认全勾上：不勾就是「照旧全量执行」，老行为不变。
+        """
         self.beginResetModel()
         self.fingerprint = fingerprint
-        self._rows = [dict(r, result=PENDING_LABEL) for r in rows]
+        self._rows = [
+            dict(
+                r,
+                result=PENDING_LABEL,
+                checked=Qt.Checked if r["action"] in CHECKABLE_ACTIONS else None,
+            )
+            for r in rows
+        ]
         self._index = {r["path"]: i for i, r in enumerate(self._rows)}
         self.endResetModel()
 
@@ -111,21 +128,70 @@ class PlanTableModel(QAbstractTableModel):
         row = self._rows[idx.row()]
         key = COLUMNS[idx.column()][0]
         if role == Qt.DisplayRole:
+            if key == "checked":
+                return ""  # 这列只画方框，不写字
             if key in ("local", "remote"):
                 return SIDE_LABELS.get(row.get(key, ""), row.get(key, ""))
             return row.get(key, "")
+        if role == Qt.CheckStateRole and key == "checked":
+            return row.get("checked")  # None = 这行不可勾选，方框都不画
         if role == Qt.ForegroundRole and key == "action":
             return QColor(ACTION_COLORS.get(row["action"], DEFAULT_ACTION_COLOR))
-        if role == Qt.TextAlignmentRole and key in ("action", "result"):
+        if role == Qt.TextAlignmentRole and key in ("checked", "action", "result"):
             return int(Qt.AlignCenter)
         if role == Qt.ToolTipRole:
             return row.get("error") or row.get("reason") or None
         return None
 
+    def flags(self, idx: QModelIndex):
+        flags = super().flags(idx)
+        if idx.isValid() and self._is_checkable(idx):
+            flags |= Qt.ItemIsUserCheckable
+        return flags
+
+    def setData(self, idx: QModelIndex, value, role=Qt.EditRole) -> bool:
+        if role != Qt.CheckStateRole or not self._is_checkable(idx):
+            return False
+        row = self._rows[idx.row()]
+        state = Qt.CheckState(value)
+        if state == row["checked"]:
+            return False
+        row["checked"] = state
+        self.dataChanged.emit(idx, idx, [Qt.CheckStateRole])
+        self.checkedChanged.emit()
+        return True
+
     def headerData(self, section: int, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             return COLUMNS[section][1]
         return None
+
+    # ------------------------------------------------------------ 勾选（上传哪些）
+
+    def _is_checkable(self, idx: QModelIndex) -> bool:
+        return (
+            idx.isValid()
+            and COLUMNS[idx.column()][0] == "checked"
+            and self._rows[idx.row()].get("checked") is not None
+        )
+
+    def set_all_checked(self, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in self._rows:
+            if row.get("checked") is not None:
+                row["checked"] = state
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(len(self._rows) - 1, 0), [Qt.CheckStateRole]
+            )
+        self.checkedChanged.emit()
+
+    def checked_paths(self) -> frozenset[str] | None:
+        """勾了哪些路径。**全勾**（或没有可勾的行）时返回 None，意思是「不带清单、照常全量」。
+        """
+        checkable = [r for r in self._rows if r.get("checked") is not None]
+        picked = {r["path"] for r in checkable if r["checked"] == Qt.Checked}
+        return None if len(picked) == len(checkable) else frozenset(picked)
 
 
 class ActionFilterProxy(QSortFilterProxyModel):

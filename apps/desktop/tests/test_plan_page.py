@@ -5,7 +5,7 @@
 """
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QWidget
 
 from notion_sync_desktop.models.plan_model import (
@@ -96,25 +96,83 @@ def test_display_role_translates_side_and_result():
     def cell(column, role=Qt.DisplayRole):
         return model.data(model.index(0, column), role)
 
-    assert cell(0) == "PUSH"
-    assert cell(1) == "a.md"
-    assert cell(2) == "无"
-    assert cell(3) == "新建"
-    assert cell(4) == "失败"
+    assert cell(0) == ""  # 勾选列不写字，只画方框
+    assert cell(1) == "PUSH"
+    assert cell(2) == "a.md"
+    assert cell(3) == "无"
+    assert cell(4) == "新建"
+    assert cell(5) == "失败"
 
 
 def test_action_cell_is_colored_and_headers_are_chinese():
     model = PlanTableModel()
     model.set_plan("fp", [make_row(action="CONFLICT", reason="both changed")])
 
-    color = model.data(model.index(0, 0), Qt.ForegroundRole)
+    color = model.data(model.index(0, 1), Qt.ForegroundRole)
     assert color.name() == "#c42b1c"
     # 非动作列不上色
-    assert model.data(model.index(0, 1), Qt.ForegroundRole) is None
-    assert model.data(model.index(0, 0), Qt.ToolTipRole) == "both changed"
+    assert model.data(model.index(0, 2), Qt.ForegroundRole) is None
+    assert model.data(model.index(0, 1), Qt.ToolTipRole) == "both changed"
     assert [
         model.headerData(i, Qt.Horizontal, Qt.DisplayRole) for i in range(len(COLUMNS))
-    ] == ["动作", "路径", "本地", "远端", "结果"]
+    ] == ["", "动作", "路径", "本地", "远端", "结果"]
+
+
+def test_checkable_rows_start_checked_and_others_have_no_box():
+    """能勾的只有「待处理」那些行；默认全勾（= 老的全量执行行为）。"""
+    model = PlanTableModel()
+    model.set_plan("fp", [make_row("a.md"), make_row("s.md", "SKIP")])
+
+    assert model.row(0)["checked"] == Qt.Checked
+    assert model.row(1)["checked"] is None
+    assert model.data(model.index(0, 0), Qt.CheckStateRole) == Qt.Checked
+    assert model.data(model.index(1, 0), Qt.CheckStateRole) is None
+    assert model.flags(model.index(0, 0)) & Qt.ItemIsUserCheckable
+    assert not model.flags(model.index(1, 0)) & Qt.ItemIsUserCheckable
+    assert not model.flags(model.index(0, 1)) & Qt.ItemIsUserCheckable  # 只有勾选列能勾
+
+
+def test_unchecking_narrows_checked_paths_and_signals():
+    model = PlanTableModel()
+    model.set_plan("fp", [make_row("a.md"), make_row("b.md")])
+    assert model.checked_paths() is None  # 全勾 = 不带清单
+    fired = []
+    model.checkedChanged.connect(lambda: fired.append(1))
+
+    assert model.setData(model.index(1, 0), Qt.Unchecked, Qt.CheckStateRole)
+
+    assert model.checked_paths() == frozenset({"a.md"})
+    assert fired == [1]
+
+
+def test_set_data_ignores_other_columns_and_roles():
+    model = PlanTableModel()
+    model.set_plan("fp", [make_row("a.md")])
+
+    assert not model.setData(model.index(0, 0), Qt.Unchecked, Qt.EditRole)
+    assert not model.setData(model.index(0, 2), Qt.Unchecked, Qt.CheckStateRole)
+    assert not model.setData(model.index(0, 0), Qt.Checked, Qt.CheckStateRole)  # 没变化
+    assert model.checked_paths() is None
+
+
+def test_checked_paths_is_none_when_nothing_is_checkable():
+    model = PlanTableModel()
+    model.set_plan("fp", [make_row("s.md", "SKIP")])
+    assert model.checked_paths() is None
+
+
+def test_set_all_checked_touches_only_the_checkable_rows():
+    model = PlanTableModel()
+    model.set_plan("fp", [make_row("a.md"), make_row("b.md"), make_row("s.md", "SKIP")])
+
+    model.set_all_checked(False)
+
+    assert model.checked_paths() == frozenset()
+    assert model.row(2)["checked"] is None  # SKIP 行本来就没方框
+
+    model.set_all_checked(True)
+
+    assert model.checked_paths() is None
 
 
 def test_update_result_ignores_unknown_path():
@@ -143,7 +201,7 @@ def test_proxy_filters_by_action():
 
     proxy.set_actions(frozenset({"CONFLICT", "BLOCKED"}))
     assert proxy.rowCount() == 2
-    assert proxy.data(proxy.index(0, 1)) == "a.md"  # 排除了 PUSH 与 SKIP
+    assert proxy.data(proxy.index(0, 2)) == "a.md"  # 排除了 PUSH 与 SKIP
 
     proxy.set_actions(None)
     assert proxy.rowCount() == 4
@@ -231,6 +289,72 @@ def test_execute_sends_expect_plan(page):
     widget.executeButton.click()
 
     assert fired == [("sync", ["--expect-plan", "fp-9"])]
+
+
+def test_execute_sends_only_file_for_the_checked_subset(page):
+    widget, model, _, _ = page
+    model.set_plan("fp-9", [make_row("a.md"), make_row("b.md"), make_row("c.md")])
+    model.setData(model.index(1, 0), Qt.Unchecked, Qt.CheckStateRole)
+    fired = []
+    widget.runRequested.connect(lambda *a: fired.append(a))
+
+    widget.executeButton.click()
+
+    only_file = widget._only_file
+    assert only_file.read_text(encoding="utf-8").split() == ["a.md", "c.md"]
+    assert fired == [("sync", ["--expect-plan", "fp-9", "--only-file", str(only_file)])]
+
+
+def test_only_file_is_deleted_when_the_run_finishes(page):
+    widget, model, _, _ = page
+    model.set_plan("fp", [make_row("a.md"), make_row("b.md")])
+    model.setData(model.index(1, 0), Qt.Unchecked, Qt.CheckStateRole)
+    widget.executeButton.click()
+    path = widget._only_file
+    assert path.exists()
+
+    widget.on_run_finished(0)
+
+    assert not path.exists()
+    assert widget._only_file is None
+
+
+def test_execute_button_disabled_when_nothing_is_checked(page):
+    widget, model, _, _ = page
+    model.set_plan("fp", [make_row("a.md")])
+
+    model.set_all_checked(False)
+
+    assert not widget.executeButton.isEnabled()
+    assert widget.selectAll.checkState() == Qt.Unchecked
+
+
+def test_select_all_box_shows_partial_and_toggles_everything(page):
+    widget, model, _, _ = page
+    model.set_plan("fp", [make_row("a.md"), make_row("b.md")])
+    model.setData(model.index(0, 0), Qt.Unchecked, Qt.CheckStateRole)
+    assert widget.selectAll.checkState() == Qt.PartiallyChecked
+
+    widget.selectAll.click()  # 半选时点一下 = 全勾上
+    assert model.checked_paths() is None
+    assert widget.selectAll.checkState() == Qt.Checked
+
+    widget.selectAll.click()  # 全勾时再点 = 全取消
+    assert model.checked_paths() == frozenset()
+    assert widget.selectAll.checkState() == Qt.Unchecked
+    assert not widget.executeButton.isEnabled()
+
+
+def test_clicking_the_checkbox_cell_toggles_the_row(page, qtbot):
+    """表格不让编辑（NoEditTriggers），但方框得能点——这条盯着这个前提。"""
+    widget, model, _, _ = page
+    model.set_plan("fp", [make_row("a.md")])
+    rect = widget.table.visualRect(widget.table.model().index(0, 0))
+
+    # 点方框本身（列宽没布局时不可靠，所以按列的左边算）
+    qtbot.mouseClick(widget.table.viewport(), Qt.LeftButton, pos=QPoint(rect.left() + 24, rect.center().y()))
+
+    assert model.row(0)["checked"] == Qt.Unchecked
 
 
 def test_refresh_preview_asks_for_status(page):

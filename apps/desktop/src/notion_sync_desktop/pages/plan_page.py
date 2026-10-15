@@ -9,6 +9,8 @@
 那里的文件夹校验、token 提示和日志就都只有一份。
 """
 
+import os
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -17,6 +19,7 @@ from qfluentwidgets import (
     Action,
     CaptionLabel,
     CardWidget,
+    CheckBox,
     InfoBar,
     InfoBarPosition,
     PrimaryPushButton,
@@ -69,6 +72,8 @@ class PlanPage(QWidget):
         self._folder_of = folder_provider
         self._busy = False
         self._pending_diff: str | None = None
+        # 勾选清单的临时文件，跑完就删（见 _execute_plan / on_run_finished）
+        self._only_file: Path | None = None
 
         self._proxy = ActionFilterProxy(self)
         self._proxy.setSourceModel(model)
@@ -89,8 +94,8 @@ class PlanPage(QWidget):
         root.addWidget(SubtitleLabel("计划预览", self))
         root.addWidget(
             CaptionLabel(
-                "先「重新预览」看清这一轮要做什么，再点「执行此计划」；"
-                "预览之后内容又变了会被拒绝执行，并自动重出预览",
+                "先「重新预览」看清这一轮要做什么，再点「执行此计划」——只执行勾上的行，"
+                "不想动的取消勾选即可；预览之后内容又变了会被拒绝执行，并自动重出预览",
                 self,
             )
         )
@@ -114,8 +119,12 @@ class PlanPage(QWidget):
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         self.previewButton = PushButton("重新预览", card)
+        self.selectAll = CheckBox("全选", card)
+        self.selectAll.setTristate(True)
         self.executeButton = PrimaryPushButton("执行此计划", card)
+        self.executeButton.setToolTip("只执行勾上的行；全部勾上就是整份计划")
         buttons.addWidget(self.previewButton)
+        buttons.addWidget(self.selectAll)
         buttons.addStretch(1)
         buttons.addWidget(self.executeButton)
 
@@ -139,7 +148,7 @@ class PlanPage(QWidget):
         header = self.table.horizontalHeader()
         for column in range(self._model.columnCount()):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)  # 路径列吃掉剩余宽度
+        header.setSectionResizeMode(2, QHeaderView.Stretch)  # 路径列吃掉剩余宽度
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
 
         layout.addWidget(self.table, 1)
@@ -152,9 +161,11 @@ class PlanPage(QWidget):
         self.filter.currentItemChanged.connect(self._on_filter_changed)
         self.previewButton.clicked.connect(self.refresh_preview)
         self.executeButton.clicked.connect(self._execute_plan)
+        self.selectAll.clicked.connect(self._toggle_all)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
-        # 计划一换，指纹就有了，「执行此计划」该亮起来
+        # 计划一换，指纹就有了，「执行此计划」和「全选」该跟着走
         self._model.modelReset.connect(self._sync_buttons)
+        self._model.checkedChanged.connect(self._sync_buttons)
 
     # ------------------------------------------------------------ 对外接口
 
@@ -176,7 +187,10 @@ class PlanPage(QWidget):
         self._sync_buttons()
 
     def on_run_finished(self, exit_code: int) -> None:
-        """`--backup-only` 跑完就把对比窗口拉起来。"""
+        """`--backup-only` 跑完就把对比窗口拉起来；顺便清掉勾选清单。"""
+        if self._only_file is not None:
+            self._only_file.unlink(missing_ok=True)
+            self._only_file = None
         path, self._pending_diff = self._pending_diff, None
         if path is None or exit_code != 0:
             return  # 失败时引擎已经报过错了，别再弹一次
@@ -189,7 +203,26 @@ class PlanPage(QWidget):
         if not fingerprint:
             self._warn("还没有计划", "先点「重新预览」生成一份")
             return
-        self.runRequested.emit("sync", ["--expect-plan", fingerprint])
+        flags = ["--expect-plan", fingerprint]
+        picked = self._model.checked_paths()
+        if picked is not None:  # 全勾时返回 None：不带清单，走原来的全量
+            self._only_file = self._write_only_file(picked)
+            flags += ["--only-file", str(self._only_file)]
+        self.runRequested.emit("sync", flags)
+
+    def _toggle_all(self) -> None:
+        """「全选」被点：还没全勾就全勾上，已经全勾就全取消。"""
+        self._model.set_all_checked(self._model.checked_paths() is not None)
+
+    def _write_only_file(self, paths: frozenset[str]) -> Path:
+        """勾选清单落成临时文件——路径多了塞不进命令行，交给引擎自己读。
+
+        放系统临时目录，不落同步根目录（那儿放什么都会被扫描当成文件）。
+        """
+        fd, name = tempfile.mkstemp(prefix="notion-sync-only-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(sorted(paths)))
+        return Path(name)
 
     def _resolve(self, path: str, keep: str) -> None:
         self.runRequested.emit("resolve", [path, "--keep", keep])
@@ -243,7 +276,23 @@ class PlanPage(QWidget):
 
     def _sync_buttons(self) -> None:
         self.previewButton.setEnabled(not self._busy)
-        self.executeButton.setEnabled(not self._busy and bool(self._model.fingerprint))
+        # 一个都没勾就别让点「执行」——空清单跑出去只会白等一场
+        picked = self._model.checked_paths()
+        self.executeButton.setEnabled(
+            not self._busy and bool(self._model.fingerprint) and picked != frozenset()
+        )
+        self._sync_select_all(picked)
+
+    def _sync_select_all(self, picked: frozenset[str] | None) -> None:
+        """「全选」跟着实际勾选显示：全勾 → 勾上，一个没勾 → 空，勾了一半 → 半选。"""
+        state = (
+            Qt.Checked
+            if picked is None
+            else (Qt.Unchecked if not picked else Qt.PartiallyChecked)
+        )
+        self.selectAll.blockSignals(True)
+        self.selectAll.setCheckState(state)
+        self.selectAll.blockSignals(False)
 
     def _warn(self, title: str, content: str) -> None:
         InfoBar.warning(

@@ -17,8 +17,15 @@ from pathlib import Path
 from . import __version__
 from .api import RunOptions, run
 from .cancel import CancelToken
+from .canonical import normalize_path
 from .protocol import PROTOCOL_VERSION
 from .reporter import ConsoleReporter, JsonlReporter
+
+
+def _read_only_file(path: Path) -> frozenset[str]:
+    """读勾选清单：每行一个相对路径，空行忽略；归一成与计划行一致的 POSIX 形式。"""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return frozenset(normalize_path(s) for s in (ln.strip() for ln in lines) if s)
 
 
 def _control_loop(cancel: CancelToken) -> None:
@@ -71,6 +78,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-plan")
     p.add_argument("--parent-page-id")
     p.add_argument(
+        "--only-file",
+        type=Path,
+        help="只执行这个文件里列出的路径（每行一个，相对同步根目录）；界面勾选子集用",
+    )
+    p.add_argument(
         "--keep",
         choices=["local", "remote", "merged"],
         help="resolve 的裁决：保留本地 / 保留远端 / 已手动合并到本地",
@@ -115,6 +127,12 @@ def main(argv: list[str] | None = None) -> int:
             target=_control_loop, args=(cancel,), daemon=True
         ).start()
 
+    only = None
+    if a.only_file:
+        if not a.only_file.is_file():
+            p.error(f"--only-file 找不到文件：{a.only_file}")
+        only = _read_only_file(a.only_file)
+
     opts = RunOptions(
         dry_run=a.dry_run,
         full=a.full,
@@ -123,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         path=a.path,
         keep=a.keep,
         backup_only=a.backup_only,
+        only=only,
     )
     return run(a.command, a.root or Path.cwd(), opts, rep, cancel).exit_code
 

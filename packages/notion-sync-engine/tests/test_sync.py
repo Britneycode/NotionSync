@@ -1152,6 +1152,33 @@ def test_cli_init(tmp_path, monkeypatch):
         assert (tmp_path / ".sync-state.json").exists()
 
 
+def test_cli_only_file_is_read_into_options(tmp_path, monkeypatch):
+    """--only-file：每行一个路径，空行忽略，反斜杠归一成与计划行一致的 POSIX 形式。"""
+    from sync_lib import cli
+
+    listing = tmp_path / "only.txt"
+    listing.write_text("a.md\n\ndocs\\b.md\n  \n", encoding="utf-8")
+    seen = {}
+
+    def fake_run(command, root, opts, rep, cancel):
+        seen["opts"] = opts
+        return api.RunResult(0, {})
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    code = cli.main(["sync", "--root", str(tmp_path), "--only-file", str(listing)])
+
+    assert code == 0
+    assert seen["opts"].only == frozenset({"a.md", "docs/b.md"})
+
+
+def test_cli_only_file_missing_is_a_usage_error(tmp_path):
+    from sync_lib import cli
+
+    with pytest.raises(SystemExit) as e:
+        cli.main(["sync", "--only-file", str(tmp_path / "nope.txt")])
+    assert e.value.code == 2
+
+
 # --- remote: 远端读取（cmd_sync 主线 Task A） ---
 
 
@@ -2749,6 +2776,41 @@ def test_api_run_expect_plan_match_proceeds(tmp_path, monkeypatch):
 
     assert result.exit_code == EXIT.OK
     assert mocks["execute_plan"].called
+
+
+def test_api_run_only_executes_the_listed_subset(tmp_path, monkeypatch):
+    """勾选子集：只执行清单里的路径，没勾的原样留在计划里。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    plan = {
+        "a.md": Classification(Action.PUSH),
+        "b.md": Classification(Action.PUSH),
+        "c.md": Classification(Action.PUSH),
+        "d.md": Classification(Action.SKIP),
+    }
+    mocks, _ = _patch_pipeline(monkeypatch, plan)
+
+    buf = io.StringIO()
+    # d.md 也在清单里，但它本来就不执行——不在可执行集合里就自然被忽略
+    result = api.run(
+        "sync",
+        tmp_path,
+        RunOptions(only=frozenset({"a.md", "c.md", "d.md"})),
+        JsonlReporter(buf, "r-x"),
+        CancelToken(),
+    )
+
+    assert result.exit_code == EXIT.OK
+    assert _executed(mocks) == {"a.md", "c.md"}
+    started = [
+        e["data"]["path"]
+        for e in _parse_events(buf.getvalue())
+        if e["type"] == "file.started"
+    ]
+    assert started == ["a.md", "c.md"]
+    assert result.summary["failed"] == 0
 
 
 def test_api_run_reports_failed_and_needs_attention(tmp_path, monkeypatch):

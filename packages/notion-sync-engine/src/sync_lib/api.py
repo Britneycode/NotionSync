@@ -74,6 +74,7 @@ class RunOptions:
 
     刻意不含 `adopt_remote / paths`：那几项属于设计 §7.5 里尚未实现的命令，
     加了就是死占位符。`path` / `keep` / `backup_only` 只服务于 `resolve`（P3 起真实存在）。
+    `only` 是界面的勾选子集：非 None 时只执行集合里的路径（清单由 `--only-file` 读入）。
     """
 
     dry_run: bool = False
@@ -83,6 +84,7 @@ class RunOptions:
     path: str | None = None  # resolve 的目标
     keep: str | None = None  # resolve 的裁决：local / remote / merged
     backup_only: bool = False  # resolve 只落远端副本，不做裁决
+    only: frozenset[str] | None = None  # 只执行这些路径（POSIX 相对）；None = 全量
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +95,8 @@ class RunOptions:
             "path": self.path,
             "keep": self.keep,
             "backup_only": self.backup_only,
+            # 只记条数：事件流会被写进运行历史，几百个路径没必要跟着一起落盘
+            "only": len(self.only) if self.only is not None else None,
         }
 
 
@@ -205,6 +209,10 @@ def run(
                 _warn_push_remote_changes(plan, rep)
 
             filtered = _filter_plan(plan, command)
+            if opts.only is not None:
+                # 勾选子集：只留被选中的路径。指纹仍按全量计划校验（上面），
+                # 所以「预览后内容又变了」照样会在执行前被挡下。
+                filtered = {p: c for p, c in filtered.items() if p in opts.only}
             filtered, escape_errors = _check_local_containment(filtered, root)
 
             # 需要用户处理的计划项：CONFLICT / BLOCKED。注意不能读 summary["conflicts"]

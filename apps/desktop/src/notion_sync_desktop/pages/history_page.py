@@ -178,10 +178,12 @@ class HistoryPage(QWidget):
         self.planTable.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.planTable.setWordWrap(False)
         self.planTable.verticalHeader().hide()
+        # 勾选列是「计划页」用来挑文件执行的；回放过去的记录没有这回事，藏掉
+        self.planTable.setColumnHidden(0, True)
         header = self.planTable.horizontalHeader()
         for column in range(self.plan_model.columnCount()):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)  # 路径列
+        header.setSectionResizeMode(2, QHeaderView.Stretch)  # 路径列
 
         layout.addLayout(top)
         layout.addWidget(self.planTable, 1)
