@@ -123,8 +123,9 @@ def _execute_push(path, state_mgr, remote, local_root):
     if compute_hash(current_remote_content) != entry["base_remote_hash"]:
         raise Exception("Remote changed during push")
 
-    # 3. 执行更新；BR 优先取写响应体（5.5），否则读回，最后本地 hash 兜底
-    resp = remote.update_block(entry["block_id"], content)
+    # 3. 执行更新（正文超单块容量时由远端拆/并 code block）；
+    #    BR 优先取写响应体（5.5），否则读回，最后本地 hash 兜底
+    resp = remote.update_page_content(entry["page_id"], content)
     base_remote_hash = _br_from_update_response(resp, entry["block_id"], content)
     if base_remote_hash is None:
         read_back, _, read_valid = remote.read_page(entry["page_id"])

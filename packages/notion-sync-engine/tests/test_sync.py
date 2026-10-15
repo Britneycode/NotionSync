@@ -26,7 +26,13 @@ from sync_lib.planner import (
     classify_file,
     detect_renames,
 )
-from sync_lib.remote import NotionRemote, RateLimiter, retry_with_backoff
+from sync_lib.remote import (
+    MAX_BLOCK_UNITS,
+    MAX_RICH_TEXT_ELEMENTS,
+    NotionRemote,
+    RateLimiter,
+    retry_with_backoff,
+)
 from sync_lib.scanner import LocalSnapshot, scan_local
 from sync_lib.state import (
     StateManager,
@@ -577,6 +583,50 @@ def test_create_page_with_code_block():
     call_args = mock_client.pages.create.call_args[1]
     assert call_args["parent"]["data_source_id"] == "ds123"
     assert call_args["properties"]["Name"]["title"][0]["text"]["content"] == "test.md"
+    # 未超单块容量时仍只建一个 code block
+    assert len(call_args["children"]) == 1
+    assert call_args["children"][0]["code"]["rich_text"][0]["text"]["content"] == "# Hello"
+
+
+def test_create_page_splits_oversized_content_into_multiple_code_blocks():
+    """正文超过单块容量时拆成多个 code block，每块 rich_text ≤100 段。"""
+    mock_client = Mock()
+    mock_client.pages.create.return_value = {"id": "page123"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content = "a" * (MAX_BLOCK_UNITS + 1)
+    remote.create_page(
+        path="big.md", content=content, file_type="markdown", directory="", chars=len(content),
+    )
+
+    children = mock_client.pages.create.call_args[1]["children"]
+    assert len(children) == 2
+    assert all(c["type"] == "code" for c in children)
+    assert len(children[0]["code"]["rich_text"]) == MAX_RICH_TEXT_ELEMENTS
+    assert len(children[1]["code"]["rich_text"]) == 1
+    joined = "".join(
+        rt["text"]["content"] for c in children for rt in c["code"]["rich_text"]
+    )
+    assert joined == content
+
+
+def test_create_page_splits_without_breaking_surrogate_pairs():
+    """拆分点落在非 BMP 字符上时不得切碎代理对，且顺序拼接可无损还原。"""
+    mock_client = Mock()
+    mock_client.pages.create.return_value = {"id": "page123"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content = "中文🙂" * (MAX_BLOCK_UNITS // 4 + 1)
+    remote.create_page(
+        path="big.md", content=content, file_type="markdown", directory="", chars=0,
+    )
+
+    children = mock_client.pages.create.call_args[1]["children"]
+    assert len(children) == 2
+    joined = "".join(
+        rt["text"]["content"] for c in children for rt in c["code"]["rich_text"]
+    )
+    assert joined == content
 
 
 def test_read_page_single_code_block():
@@ -601,12 +651,15 @@ def test_read_page_single_code_block():
     assert struct_valid is True
 
 
-def test_read_page_invalid_structure_multiple_blocks():
+def test_read_page_concatenates_multiple_code_blocks():
+    """多块页面按文档顺序拼接还原（超长正文拆分后的读回路径）。"""
     mock_client = Mock()
     mock_client.blocks.children.list.return_value = {
         "results": [
-            {"id": "block1", "type": "code", "code": {"rich_text": []}},
-            {"id": "block2", "type": "code", "code": {"rich_text": []}},
+            {"id": "block1", "type": "code",
+             "code": {"rich_text": [{"plain_text": "line1\n"}, {"plain_text": "line2"}]}},
+            {"id": "block2", "type": "code",
+             "code": {"rich_text": [{"plain_text": "line3"}]}},
         ],
         "has_more": False,
     }
@@ -614,7 +667,66 @@ def test_read_page_invalid_structure_multiple_blocks():
     remote = NotionRemote(mock_client, "db123", "ds123")
     content, block_id, struct_valid = remote.read_page("page123")
 
+    assert content == "line1\nline2line3"
+    assert block_id == "block1"
+    assert struct_valid is True
+
+
+def test_read_page_invalid_structure_non_code_block():
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": []}}],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content, block_id, struct_valid = remote.read_page("page123")
+
     assert struct_valid is False
+
+
+def test_read_page_invalid_structure_empty_page():
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {"results": [], "has_more": False}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content, block_id, struct_valid = remote.read_page("page123")
+
+    assert struct_valid is False
+
+
+def test_create_then_read_roundtrip_for_oversized_content():
+    """create_page 拆出的多块，经 read_page 必须无损拼回（否则 PULL 会损坏内容）。"""
+    mock_client = Mock()
+    mock_client.pages.create.return_value = {"id": "page123"}
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    content = "中文🙂" * (MAX_BLOCK_UNITS // 4 + 1)
+    remote.create_page("big.md", content, "markdown", "", 0)
+
+    # 把建页时的 children 转成 blocks.children.list 的响应形状：
+    # 真实 API 会在 rich_text 每项上附 plain_text，并给每个块分配 id
+    children = mock_client.pages.create.call_args[1]["children"]
+    blocks = [
+        {
+            "id": f"block{index}",
+            "type": "code",
+            "code": {
+                "language": child["code"]["language"],
+                "rich_text": [
+                    {"plain_text": rt["text"]["content"]} for rt in child["code"]["rich_text"]
+                ],
+            },
+        }
+        for index, child in enumerate(children)
+    ]
+    mock_client.blocks.children.list.return_value = {"results": blocks, "has_more": False}
+
+    read_back, block_id, struct_valid = remote.read_page("page123")
+
+    assert struct_valid is True
+    assert block_id == "block0"
+    assert read_back == content
 
 
 def test_update_block_splits_rich_text():
@@ -634,6 +746,124 @@ def test_update_block_splits_rich_text():
     assert rich_text[1]["text"]["content"] == "a"
 
 
+# --- remote: update_page_content（整页替换，必要时增删 code block） ---
+
+
+def _code_block_stub(block_id, text, language="markdown"):
+    return {
+        "id": block_id,
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": text}], "language": language},
+    }
+
+
+def test_update_page_content_single_block_returns_write_response():
+    """单块整页：就地替换并返回写响应体，BR 仍可由响应体算出。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "old")],
+        "has_more": False,
+    }
+    mock_client.blocks.update.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "new"}]},
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    resp = remote.update_page_content("p1", "new")
+
+    assert resp["id"] == "b1"
+    assert mock_client.blocks.update.call_args[1]["block_id"] == "b1"
+    assert mock_client.blocks.children.append.call_count == 0
+    assert mock_client.blocks.delete.call_count == 0
+
+
+def test_update_page_content_appends_when_content_grows():
+    """正文变长：原地更新首块并在末尾追加新块，返回 None 交调用方读回重算 BR。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "old")],
+        "has_more": False,
+    }
+    mock_client.blocks.update.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "x"}]},
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    resp = remote.update_page_content("p1", "a" * (MAX_BLOCK_UNITS + 1))
+
+    assert resp is None
+    assert mock_client.blocks.update.call_args[1]["block_id"] == "b1"
+    assert mock_client.blocks.children.append.call_count == 1
+    appended = mock_client.blocks.children.append.call_args[1]
+    assert appended["block_id"] == "p1"
+    assert appended["children"][0]["code"]["language"] == "markdown"
+    assert mock_client.blocks.delete.call_count == 0
+
+
+def test_update_page_content_deletes_surplus_blocks():
+    """正文变短：原地更新首块，删除多余的 code block。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "a"), _code_block_stub("b2", "b")],
+        "has_more": False,
+    }
+    mock_client.blocks.update.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "short"}]},
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    resp = remote.update_page_content("p1", "short")
+
+    assert resp is None
+    assert mock_client.blocks.delete.call_count == 1
+    assert mock_client.blocks.delete.call_args[1]["block_id"] == "b2"
+    assert mock_client.blocks.children.append.call_count == 0
+
+
+def test_update_page_content_updates_every_block_in_place():
+    """块数不变（多块）：逐块就地更新，首块 id 保持稳定。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "a"), _code_block_stub("b2", "b")],
+        "has_more": False,
+    }
+    mock_client.blocks.update.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "x"}]},
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    resp = remote.update_page_content("p1", "a" * (MAX_BLOCK_UNITS + 1))
+
+    assert resp is None
+    updated = [call[1]["block_id"] for call in mock_client.blocks.update.call_args_list]
+    assert updated == ["b1", "b2"]
+    assert mock_client.blocks.children.append.call_count == 0
+    assert mock_client.blocks.delete.call_count == 0
+
+
+def test_update_page_content_non_code_block_returns_none():
+    """结构异常：不写入，返回 None 由调用方按读回结果处理。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": []}}],
+        "has_more": False,
+    }
+
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    resp = remote.update_page_content("p1", "new")
+
+    assert resp is None
+    assert mock_client.blocks.update.call_count == 0
+
+
 # --- executor: 执行计划（PUSH/PULL + 乐观并发校验） ---
 
 
@@ -644,7 +874,7 @@ def test_execute_push(tmp_path):
     state_mgr = Mock()
     remote = Mock()
     remote.read_page.return_value = ("old content", "block123", True)
-    remote.update_block.return_value = {"last_edited_time": "2026-10-14T12:00:00Z"}
+    remote.update_page_content.return_value = {"last_edited_time": "2026-10-14T12:00:00Z"}
 
     # 最小改动：Mock 的 get_file 默认返回 Mock，无法下标访问；
     # 设为真实 dict 使写前校验通过（见 brief 授权）
@@ -662,7 +892,7 @@ def test_execute_push(tmp_path):
 
     # 验证
     assert summary.pushed == 1
-    remote.update_block.assert_called_once()
+    remote.update_page_content.assert_called_once()
     state_mgr.set_pending.assert_called_once()
     state_mgr.clear_pending.assert_called_once()
 
@@ -1006,7 +1236,7 @@ def test_execute_push_uses_response_for_br(tmp_path):
 
     remote = Mock()
     remote.read_page.return_value = ("old content", "b1", True)
-    remote.update_block.return_value = {
+    remote.update_page_content.return_value = {
         "id": "b1",
         "type": "code",
         "code": {"rich_text": [{"plain_text": "new content"}]},
@@ -1038,7 +1268,7 @@ def test_execute_push_br_fallback_readback(tmp_path):
         ("old content", "b1", True),
         ("new content", "b1", True),
     ]
-    remote.update_block.return_value = {
+    remote.update_page_content.return_value = {
         "id": "b1",
         "type": "code",
         "code": {"rich_text": [{"text": {"content": "new content"}}]},  # 无 plain_text
@@ -1052,7 +1282,7 @@ def test_execute_push_br_fallback_readback(tmp_path):
 
 
 def test_execute_push_valid_false_records_error(tmp_path):
-    """H-I-2：写前校验结构异常时不崩溃，记入 errors，且不调用 update_block。"""
+    """H-I-2：写前校验结构异常时不崩溃，记入 errors，且不写入远端。"""
     (tmp_path / "test.md").write_text("new content")
 
     mgr = StateManager(tmp_path)
@@ -1071,7 +1301,7 @@ def test_execute_push_valid_false_records_error(tmp_path):
     assert summary.pushed == 0
     assert len(summary.errors) == 1
     assert "invalid-structure" in summary.errors[0]["error"]
-    remote.update_block.assert_not_called()
+    remote.update_page_content.assert_not_called()
 
 
 def test_execute_push_optimistic_conflict(tmp_path):
@@ -1093,7 +1323,7 @@ def test_execute_push_optimistic_conflict(tmp_path):
 
     assert summary.pushed == 0
     assert len(summary.errors) == 1
-    remote.update_block.assert_not_called()
+    remote.update_page_content.assert_not_called()
 
 
 def test_execute_pull(tmp_path):

@@ -8,6 +8,25 @@ from notion_client import Client
 
 from .canonical import split_rich_text
 
+# Notion 单个 code block 的 rich_text 上限：100 个元素 × 每元素 2000 UTF-16 码元。
+# 正文超出该容量时必须拆成多个 code block，读回时按块顺序拼接还原。
+MAX_RICH_TEXT_ELEMENTS = 100
+MAX_UNITS_PER_ELEMENT = 2000
+MAX_BLOCK_UNITS = MAX_RICH_TEXT_ELEMENTS * MAX_UNITS_PER_ELEMENT
+
+
+def split_into_blocks(content: str) -> list[str]:
+    """按单块容量把正文切成若干 code block 的文本（顺序拼接可无损还原）"""
+    return split_rich_text(content, max_units=MAX_BLOCK_UNITS)
+
+
+def _rich_text(text: str) -> list[dict]:
+    """切分为 Notion rich_text 数组（每元素 ≤2000 UTF-16 码元）"""
+    return [
+        {"type": "text", "text": {"content": chunk}}
+        for chunk in split_rich_text(text, max_units=MAX_UNITS_PER_ELEMENT)
+    ]
+
 
 class RateLimiter:
     """令牌桶限流器"""
@@ -71,13 +90,23 @@ class NotionRemote:
         self.data_source_id = data_source_id
         self.limiter = RateLimiter(rate=2.5)
 
+    def _code_block(self, text: str, language: str) -> dict:
+        """构造 code block（正文超出单块容量时由调用方拆成多个）"""
+        return {
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": _rich_text(text),
+                "language": language,
+            },
+        }
+
     def create_page(self, path, content, file_type, directory, chars):
-        """创建页面"""
+        """创建页面（正文超出单块容量时拆成多个 code block）"""
         self.limiter.wait()
 
-        # 切分 rich_text
-        chunks = split_rich_text(content)
-        rich_text = [{"type": "text", "text": {"content": chunk}} for chunk in chunks]
+        language = self._map_language(file_type)
+        children = [self._code_block(chunk, language) for chunk in split_into_blocks(content)]
 
         response = retry_with_backoff(lambda: self.client.pages.create(
             parent={"data_source_id": self.data_source_id},
@@ -88,14 +117,7 @@ class NotionRemote:
                 "Directory": {"rich_text": [{"text": {"content": directory}}]},
                 "Chars": {"number": chars},
             },
-            children=[{
-                "object": "block",
-                "type": "code",
-                "code": {
-                    "rich_text": rich_text,
-                    "language": self._map_language(file_type),
-                },
-            }],
+            children=children,
         ))
         return response["id"]
 
@@ -173,8 +195,8 @@ class NotionRemote:
         plain = rich_text[0].get("plain_text")
         return plain if plain else None
 
-    def read_page(self, page_id):
-        """读取页面正文（分页拉全 children 后做结构校验）"""
+    def _list_children(self, page_id: str) -> list:
+        """分页拉全页面的全部子块（按文档顺序）"""
         blocks = []
         start_cursor = None
         while True:
@@ -192,27 +214,73 @@ class NotionRemote:
                 break
             start_cursor = response.get("next_cursor")
 
-        code_blocks = [b for b in blocks if b["type"] == "code"]
+        return blocks
 
-        # 结构校验
-        if len(code_blocks) != 1 or len(blocks) != 1:
+    def read_page(self, page_id):
+        """读取页面正文（分页拉全 children，按块顺序拼接后做结构校验）"""
+        blocks = self._list_children(page_id)
+
+        # 结构校验：正文必须非空且全部由 code block 组成
+        if not blocks or any(b["type"] != "code" for b in blocks):
             return None, None, False
 
-        block = code_blocks[0]
-        rich_text = block["code"]["rich_text"]
-        content = "".join(rt["plain_text"] for rt in rich_text)
+        content = "".join(
+            rt["plain_text"]
+            for block in blocks
+            for rt in block["code"]["rich_text"]
+        )
 
-        return content, block["id"], True
+        # 首块 id 作为状态里的 block_id：就地替换时保持稳定
+        return content, blocks[0]["id"], True
 
     def update_block(self, block_id: str, content: str) -> dict:
-        """替换 code block 的全部 rich_text 内容（按 UTF-16 码元切分，≤2000/段）"""
-        from .canonical import split_rich_text
+        """替换单个 code block 的全部 rich_text 内容（按 UTF-16 码元切分，≤2000/段）"""
         self.limiter.wait()
-        chunks = split_rich_text(content, max_units=2000)
-        rich_text = [{"type": "text", "text": {"content": c}} for c in chunks]
+        rich_text = _rich_text(content)
         return retry_with_backoff(
             lambda: self.client.blocks.update(block_id=block_id, code={"rich_text": rich_text}),
         )
+
+    def update_page_content(self, page_id: str, content: str):
+        """把页面正文整体替换为 content，必要时增删 code block。
+
+        返回写响应体；只有单块整页时才覆盖全文（可直接用于重算 BR），
+        涉及多块或增删块时返回 None，由调用方读回远端重算。
+        """
+        existing = self._list_children(page_id)
+        if not existing or any(b["type"] != "code" for b in existing):
+            return None
+
+        chunks = split_into_blocks(content)
+        language = existing[0]["code"].get("language") or "plain text"
+
+        # 就地替换已有块：块数不变时首块 id 保持稳定，状态里的 block_id 仍然有效
+        resp = None
+        for block, chunk in zip(existing, chunks):
+            resp = self.update_block(block["id"], chunk)
+
+        # 内容变长 → 追加新块；变短 → 删除多余块
+        for chunk in chunks[len(existing):]:
+            self._append_code_block(page_id, chunk, language)
+        for block in existing[len(chunks):]:
+            self._delete_block(block["id"])
+
+        if len(existing) == 1 and len(chunks) == 1:
+            return resp
+        return None
+
+    def _append_code_block(self, page_id: str, text: str, language: str) -> dict:
+        """在页面末尾追加一个 code block"""
+        self.limiter.wait()
+        return retry_with_backoff(lambda: self.client.blocks.children.append(
+            block_id=page_id,
+            children=[self._code_block(text, language)],
+        ))
+
+    def _delete_block(self, block_id: str) -> dict:
+        """删除子块（正文变短时清理多余的 code block）"""
+        self.limiter.wait()
+        return retry_with_backoff(lambda: self.client.blocks.delete(block_id=block_id))
 
     def create_database(self, parent_page_id: str) -> tuple[str, str]:
         """在指定 page 下创建同步数据库，返回 (database_id, data_source_id)"""
