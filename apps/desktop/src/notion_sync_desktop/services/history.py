@@ -1,6 +1,6 @@
 """运行历史（设计 v2 §5）。
 
-每次运行落一个文件：`%LOCALAPPDATA%\\NotionSync\\runs\\<时间>-<命令>.jsonl`——
+每次运行落一个文件：`%LOCALAPPDATA%\\NotionSync\\NotionSync\\runs\\<时间>-<命令>.jsonl`——
 内容是那一刻的事件流原样（一行一个协议事件），收尾再补一行 `app.exit` 记真实
 退出码。历史是附属品：磁盘写不进去也**绝不**打断同步，最多少一条记录。
 """
