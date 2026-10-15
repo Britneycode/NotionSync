@@ -1,0 +1,21 @@
+[project]
+name = "notion-sync-workspace"
+version = "0.0.0"
+requires-python = ">=3.12"
+# 虚拟根：自身不打包，但依赖两个 workspace 成员，
+# 这样普通 `uv sync` 就会装齐全部依赖（否则它只会装根项目自己的，把成员包卸掉）
+dependencies = ["notion-sync-engine", "notion-sync-desktop"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+notion-sync-engine = { workspace = true }
+notion-sync-desktop = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*"]
+
+# 全 workspace 共用的开发工具
+[dependency-groups]
+dev = ["pytest>=8"]
