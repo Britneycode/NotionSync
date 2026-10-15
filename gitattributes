@@ -1,0 +1,50 @@
+# 与 sync.py 的 default_eol: crlf 保持一致：工作区文本文件统一为 CRLF，仓库内存储为 LF
+* text=auto eol=crlf
+
+# 源码与文档（显式声明，避免 text=auto 误判）
+*.py    text eol=crlf diff=python
+*.md    text eol=crlf diff=markdown
+*.yaml  text eol=crlf
+*.yml   text eol=crlf
+*.toml  text eol=crlf
+*.json  text eol=crlf
+*.txt   text eol=crlf
+*.csv   text eol=crlf
+*.cfg   text eol=crlf
+*.ini   text eol=crlf
+
+# 必须保持 LF 的文件（在 Linux / 容器中执行）
+*.sh    text eol=lf
+*.bash  text eol=lf
+Dockerfile text eol=lf
+Makefile   text eol=lf
+
+# Windows 脚本
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制：不做换行转换、不做文本 diff
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
+*.zip     binary
+*.gz      binary
+*.7z      binary
+*.pkl     binary
+*.pickle  binary
+*.joblib  binary
+*.npy     binary
+*.npz     binary
+*.parquet binary
+*.onnx    binary
+*.pt      binary
+*.pth     binary
+*.h5      binary
+*.pcap    binary
+*.pcapng  binary
+*.db      binary
+*.sqlite  binary

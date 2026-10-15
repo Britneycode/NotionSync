@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# 构建产物
+dist/
+build/
+
+# 同步运行时产物（生成在被同步的目标目录里，不应进入本仓库）
+.sync-state.json
+.sync-state.json.sync-tmp
+.sync.lock
+.sync.lock.json
+.sync-backup/
+
+# 旧 pywebview 界面运行态（P2 移除 ui/ 后一并清理）
+ui/state.json
+ui/last-error.log

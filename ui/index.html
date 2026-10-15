@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Notion 同步</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161a21; --panel-2:#1b2028; --border:#252b35;
+    --text:#e6e9ef; --muted:#8b93a3; --accent:#5b8cff; --accent-dim:#2f4a8f;
+    --ok:#3ecf8e; --err:#ff6b6b; --warn:#f0b429;
+    --mono:"Cascadia Code","Consolas","SF Mono",monospace;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{
+    background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column;
+    font:14px/1.5 "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+    -webkit-font-smoothing:antialiased; user-select:none;
+  }
+  header{display:flex; align-items:center; gap:12px; padding:16px 20px 12px}
+  h1{font-size:15px; font-weight:600; letter-spacing:.3px}
+  .pills{margin-left:auto; display:flex; gap:8px}
+  .pill{
+    font-size:12px; padding:3px 10px; border-radius:999px;
+    border:1px solid var(--border); color:var(--muted); background:var(--panel);
+    display:flex; align-items:center; gap:6px;
+  }
+  .pill.ok{color:var(--ok); border-color:#1f4d3a}
+  .pill.bad{color:var(--err); border-color:#4d2020}
+  .dot{width:6px; height:6px; border-radius:50%; background:currentColor}
+
+  main{flex:1; display:flex; flex-direction:column; gap:12px; padding:0 20px 18px; min-height:0}
+  .card{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px}
+
+  .row{display:flex; align-items:center; gap:10px}
+  .row + .row{margin-top:10px}
+  .label{font-size:12px; color:var(--muted); min-width:52px}
+
+  input[type=text],input[type=password]{
+    flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text);
+    border-radius:8px; padding:8px 11px; font-size:13px; font-family:var(--mono);
+    outline:none; user-select:text; transition:border-color .15s;
+  }
+  input:focus{border-color:var(--accent-dim)}
+
+  button{
+    font:inherit; font-size:13px; border-radius:8px; padding:8px 14px; cursor:pointer;
+    border:1px solid var(--border); background:var(--panel-2); color:var(--text);
+    transition:background .15s, border-color .15s, opacity .15s;
+  }
+  button:hover:not(:disabled){background:#232a34; border-color:#333c49}
+  button:disabled{opacity:.4; cursor:default}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#0b1020; font-weight:600}
+  button.primary:hover:not(:disabled){background:#6f9bff; border-color:#6f9bff}
+  button.ghost{background:transparent}
+  button.danger{color:var(--err); border-color:#3d2222}
+
+  .actions{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+  .spacer{flex:1}
+  .check{display:flex; align-items:center; gap:7px; font-size:13px; color:var(--muted); cursor:pointer}
+  .check input{accent-color:var(--accent); width:15px; height:15px; cursor:pointer}
+
+  .hint{font-size:12px; color:var(--muted)}
+  .hidden{display:none !important}
+
+  .logcard{flex:1; display:flex; flex-direction:column; padding:0; overflow:hidden; min-height:120px}
+  .logbar{display:flex; align-items:center; gap:10px; padding:9px 14px; border-bottom:1px solid var(--border); font-size:12px; color:var(--muted)}
+  .logbar .title{font-weight:600; color:var(--text)}
+  #log{
+    flex:1; overflow-y:auto; padding:12px 14px; font-family:var(--mono); font-size:12.5px;
+    line-height:1.65; white-space:pre-wrap; word-break:break-all; user-select:text;
+  }
+  #log::-webkit-scrollbar{width:10px}
+  #log::-webkit-scrollbar-thumb{background:#2c333e; border-radius:6px; border:2px solid var(--panel)}
+  .l-ok{color:var(--ok)} .l-err{color:var(--err)} .l-warn{color:var(--warn)}
+  .l-cmd{color:var(--accent)} .l-dim{color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Notion 同步</h1>
+  <div class="pills">
+    <span class="pill" id="pillToken"><i class="dot"></i><span>检查中…</span></span>
+    <span class="pill" id="pillFolder"><i class="dot"></i><span>未选择文件夹</span></span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row">
+      <span class="label">文件夹</span>
+      <input type="text" id="folder" placeholder="选择或粘贴要同步的文件夹路径，例如 D:\Demo\003">
+      <button id="btnPick">选择…</button>
+    </div>
+    <div class="row" id="rowToken">
+      <span class="label">Token</span>
+      <input type="password" id="token" placeholder="Notion 集成 Token（仅本次运行有效，不写入磁盘）">
+      <button id="btnToken">使用</button>
+    </div>
+    <div class="row hidden" id="rowInit">
+      <span class="label">父页面</span>
+      <input type="text" id="parentId" placeholder="Notion 父页面 ID —— 该文件夹还没初始化，填写后建库">
+      <button class="primary" id="btnInit">初始化</button>
+    </div>
+  </section>
+
+  <section class="card actions">
+    <button class="primary" id="btnPush">推送 ↑</button>
+    <button id="btnPull">拉取 ↓</button>
+    <button id="btnSync">双向同步 ⇅</button>
+    <button id="btnStatus">查看状态</button>
+    <span class="spacer"></span>
+    <label class="check"><input type="checkbox" id="dryRun">试运行（只看计划）</label>
+    <button class="danger hidden" id="btnStop">停止</button>
+  </section>
+
+  <section class="card logcard">
+    <div class="logbar">
+      <span class="title">日志</span>
+      <span id="logHint" class="hint">选择文件夹后开始</span>
+      <span class="spacer"></span>
+      <button class="ghost" id="btnClear" style="padding:3px 10px;font-size:12px">清空</button>
+    </div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = () => window.pywebview.api;
+let running = false;
+
+function setPill(el, text, cls){
+  el.className = 'pill' + (cls ? ' ' + cls : '');
+  el.querySelector('span').textContent = text;
+}
+
+function logLine(text, cls){
+  const box = $('log');
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  box.appendChild(span);
+  box.scrollTop = box.scrollHeight;
+}
+
+function colorize(line){
+  const t = line.trim();
+  if (!t) return '';
+  if (/^(✓|✅|完成)/.test(t) || /errors=0/.test(t)) return 'l-ok';
+  if (/^(✗|错误|\[启动失败\])/.test(t) || /error/i.test(t)) return 'l-err';
+  if (/^(⚠|警告|\[!\])/.test(t)) return 'l-warn';
+  if (/^\$|^sync\.py/.test(t)) return 'l-cmd';
+  if (/^\[?\d+\/\d+\]?/.test(t)) return 'l-dim';
+  return '';
+}
+
+function setBusy(busy){
+  running = busy;
+  ['btnPush','btnPull','btnSync','btnStatus','btnInit','btnPick'].forEach(id => $(id).disabled = busy);
+  $('btnStop').classList.toggle('hidden', !busy);
+  $('logHint').textContent = busy ? '运行中…' : '就绪';
+}
+
+async function refreshFolder(){
+  const folder = $('folder').value.trim();
+  const pill = $('pillFolder');
+  if (!folder){ setPill(pill, '未选择文件夹', ''); $('rowInit').classList.add('hidden'); return; }
+  const info = await api().probe(folder);
+  if (!info.exists){ setPill(pill, '文件夹不存在', 'bad'); $('rowInit').classList.add('hidden'); return; }
+  if (info.initialized){
+    setPill(pill, '已初始化', 'ok');
+    $('rowInit').classList.add('hidden');
+  } else {
+    setPill(pill, '未初始化', 'bad');
+    $('rowInit').classList.remove('hidden');
+  }
+}
+
+async function run(command, extra = {}){
+  const folder = $('folder').value.trim();
+  if (!folder){ logLine('请先选择文件夹\n', 'l-warn'); return; }
+  const args = { folder, command, dry_run: $('dryRun').checked, ...extra };
+  const res = await api().start(args.folder, args.command, args.dry_run, args.parent_page_id || '');
+  if (!res.ok){ logLine(`✗ ${res.error}\n`, 'l-err'); return; }
+  const label = {push:'推送',pull:'拉取',sync:'双向同步',status:'查看状态',init:'初始化'}[command];
+  logLine(`$ ${label}${args.dry_run && command !== 'init' ? '（试运行）' : ''}  ·  ${folder}\n`, 'l-cmd');
+  logLine('─'.repeat(56) + '\n', 'l-dim');
+  setBusy(true);
+}
+
+async function tick(){
+  if (running){
+    const r = await api().poll();
+    if (r.text) r.text.split('\n').forEach((l, i, a) => {
+      if (i === a.length - 1 && l === '') return;
+      logLine(l + '\n', colorize(l));
+    });
+    if (r.exit_code !== null && r.exit_code !== undefined){
+      const ok = r.exit_code === 0;
+      logLine(`\n${ok ? '✓ 完成' : '✗ 退出码 ' + r.exit_code}\n`, ok ? 'l-ok' : 'l-err');
+      setBusy(false);
+      refreshFolder();
+    }
+  } else {
+    const r = await api().poll();          // 兜底：跑完后再收一次尾巴
+    if (r.text) r.text.split('\n').forEach(l => { if (l) logLine(l + '\n', colorize(l)); });
+  }
+  setTimeout(tick, 250);
+}
+
+async function init(){
+  const info = await api().bootstrap();
+  if (!info.engine || !info.python){
+    setPill($('pillToken'), '引擎缺失', 'bad');
+    logLine('✗ 找不到同步引擎或 Python 环境：\n', 'l-err');
+    if (!info.engine) logLine(`   engine/sync.py 缺失\n`, 'l-dim');
+    if (!info.python) logLine(`   .venv/Scripts/python.exe 缺失\n`, 'l-dim');
+    return;
+  }
+  setPill($('pillToken'), info.has_token ? `Token ${info.token_source}` : 'Token 未设置',
+          info.has_token ? 'ok' : 'bad');
+  $('rowToken').classList.toggle('hidden', info.has_token);
+  if (info.last_folder){ $('folder').value = info.last_folder; refreshFolder(); }
+  setBusy(false);
+  tick();
+}
+
+$('btnPick').onclick = async () => {
+  const p = await api().pick_folder();
+  if (p){ $('folder').value = p; refreshFolder(); }
+};
+$('folder').oninput = refreshFolder;
+$('folder').onchange = refreshFolder;
+$('btnToken').onclick = async () => {
+  const res = await api().use_token($('token').value);
+  if (res.ok){ setPill($('pillToken'), 'Token 本次输入', 'ok'); $('rowToken').classList.add('hidden'); $('token').value=''; }
+  else logLine(`✗ ${res.error}\n`, 'l-err');
+};
+$('btnPush').onclick = () => run('push');
+$('btnPull').onclick = () => run('pull');
+$('btnSync').onclick = () => run('sync');
+$('btnStatus').onclick = () => run('status');
+$('btnInit').onclick = () => run('init', { parent_page_id: $('parentId').value });
+$('btnStop').onclick = async () => { await api().stop(); logLine('\n⚠ 已请求停止\n', 'l-warn'); };
+$('btnClear').onclick = () => { $('log').innerHTML = ''; };
+
+window.addEventListener('pywebviewready', init);
+</script>
+</body>
+</html>
