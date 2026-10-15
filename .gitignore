@@ -15,7 +15,3 @@ build/
 .sync.lock
 .sync.lock.json
 .sync-backup/
-
-# 旧 pywebview 界面运行态（P2 移除 ui/ 后一并清理）
-ui/state.json
-ui/last-error.log

@@ -338,7 +338,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pyinstaller" },
-    { name = "pytest-qt" },
 ]
 
 [package.metadata]
@@ -350,10 +349,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "pyinstaller", specifier = ">=6.6" },
-    { name = "pytest-qt", specifier = ">=4.4" },
-]
+dev = [{ name = "pyinstaller", specifier = ">=6.6" }]
 
 [[package]]
 name = "notion-sync-engine"
@@ -388,6 +384,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pytest-qt" },
 ]
 
 [package.metadata]
@@ -397,7 +394,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-qt", specifier = ">=4.4" },
+]
 
 [[package]]
 name = "packaging"

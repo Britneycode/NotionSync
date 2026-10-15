@@ -17,5 +17,10 @@ notion-sync-desktop = { workspace = true }
 members = ["packages/*", "apps/*"]
 
 # 全 workspace 共用的开发工具
+# 放在根组里，plain `uv sync` 才会装（成员包自己的 dev 组默认不装，见 DECISIONS）
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-qt>=4.4"]
+
+# 在仓库根跑 `uv run pytest` 就把两个包的测试都带上
+[tool.pytest.ini_options]
+testpaths = ["packages/notion-sync-engine/tests", "apps/desktop/tests"]
