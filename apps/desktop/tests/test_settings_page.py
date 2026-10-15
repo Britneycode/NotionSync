@@ -135,3 +135,82 @@ def test_missing_folders_are_hidden_but_kept_on_disk(page):
     folder.with_name("moved").rename(folder)
     widget.refresh_bookmarks()
     assert widget.bookmarkList.count() == 1
+
+
+# ---------------------------------------------------------------- 开机自启
+
+
+class StubAutostart:
+    """替代 services.autostart：记录被调了什么，不真碰注册表。"""
+
+    def __init__(self, enabled: bool = False, fail: bool = False):
+        self.enabled = enabled
+        self.fail = fail
+        self.calls: list[bool] = []
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    def enable(self) -> None:
+        self.calls.append(True)
+        if self.fail:
+            raise OSError("拒绝访问")
+
+    def disable(self) -> None:
+        self.calls.append(False)
+        if self.fail:
+            raise OSError("拒绝访问")
+
+
+@pytest.fixture
+def startup_page(tmp_path, qtbot, monkeypatch):
+    """带自启开关的设置页；注册表读写整个换成桩。"""
+    stub = StubAutostart()
+    monkeypatch.setattr(mod, "autostart", stub)
+    monkeypatch.setattr(mod, "UiSettings", lambda: UiSettings(tmp_path / "settings.json"))
+    monkeypatch.setattr(mod.credentials, "get_token", lambda: (None, "none"))
+    widget = mod.SettingsPage(lambda: "")
+    qtbot.addWidget(widget)
+    yield widget, stub
+    widget.deleteLater()
+
+
+def test_autostart_switch_reads_the_state_on_build(tmp_path, qtbot, monkeypatch):
+    """开关一开始就反映注册表里的现状，且这一步不该反过来去写注册表。"""
+    stub = StubAutostart(enabled=True)
+    monkeypatch.setattr(mod, "autostart", stub)
+    monkeypatch.setattr(mod, "UiSettings", lambda: UiSettings(tmp_path / "settings.json"))
+    monkeypatch.setattr(mod.credentials, "get_token", lambda: (None, "none"))
+    widget = mod.SettingsPage(lambda: "")
+    qtbot.addWidget(widget)
+
+    assert widget.autostartSwitch.isChecked()
+    assert stub.calls == []
+    widget.deleteLater()
+
+
+def test_turning_it_on_writes_the_registry_value(startup_page):
+    widget, stub = startup_page
+
+    widget.autostartSwitch.setChecked(True)
+
+    assert stub.calls == [True]
+
+
+def test_turning_it_off_removes_the_registry_value(startup_page):
+    widget, stub = startup_page
+    widget.autostartSwitch.setChecked(True)
+
+    widget.autostartSwitch.setChecked(False)
+
+    assert stub.calls == [True, False]
+
+
+def test_a_failed_write_bounces_the_switch_back(startup_page):
+    widget, stub = startup_page
+    stub.fail = True
+
+    widget.autostartSwitch.setChecked(True)
+
+    assert widget.autostartSwitch.isChecked() is False
+    assert stub.calls == [True]  # 弹回去不该再写一次注册表

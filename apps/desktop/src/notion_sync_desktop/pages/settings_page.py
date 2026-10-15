@@ -7,7 +7,7 @@ token 只传给 keyring，不出现在命令行参数里。
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QSignalBlocker, QThread, Signal
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
@@ -21,12 +21,14 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     SubtitleLabel,
+    SwitchButton,
 )
 
 import sync_lib
 from sync_lib import credentials
 from sync_lib.protocol import PROTOCOL_VERSION
 
+from ..services import autostart
 from ..services.notion_theme import apply_theme as _apply_notion_theme
 from ..services.settings import UiSettings
 
@@ -81,6 +83,7 @@ class SettingsPage(QWidget):
         root.addWidget(SubtitleLabel("设置", self))
         root.addWidget(self._token_card())
         root.addWidget(self._theme_card())
+        root.addWidget(self._startup_card())
         root.addWidget(self._bookmark_card(), 1)
         root.addWidget(self._about_card())
 
@@ -132,6 +135,29 @@ class SettingsPage(QWidget):
         layout.addWidget(BodyLabel("主题", card))
         layout.addStretch(1)
         layout.addWidget(self.themeCombo)
+        return card
+
+    def _startup_card(self) -> CardWidget:
+        card = CardWidget(self)
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(BodyLabel("开机自动启动", card))
+        text.addWidget(CaptionLabel("登录后待在托盘里，不弹窗", card))
+
+        self.autostartSwitch = SwitchButton(card)
+        self.autostartSwitch.setOnText("开")
+        self.autostartSwitch.setOffText("关")
+        # 先设好当前值再接信号：否则这一步本身就会被当成「用户按了开关」去写注册表
+        self.autostartSwitch.setChecked(autostart.is_enabled())
+        self.autostartSwitch.checkedChanged.connect(self._on_autostart_toggled)
+
+        layout.addLayout(text)
+        layout.addStretch(1)
+        layout.addWidget(self.autostartSwitch)
         return card
 
     def _bookmark_card(self) -> CardWidget:
@@ -232,6 +258,19 @@ class SettingsPage(QWidget):
         name = list(THEME_ITEMS.values())[index]
         self.settings.theme = name
         apply_theme(name)
+
+    def _on_autostart_toggled(self, enabled: bool) -> None:
+        try:
+            if enabled:
+                autostart.enable()
+            else:
+                autostart.disable()
+        except OSError as e:  # 组策略之类的会拦住写注册表
+            self._warn("改不了开机自启", str(e))
+            with QSignalBlocker(self.autostartSwitch):  # 别把「弹回去」再当成一次用户操作
+                self.autostartSwitch.setChecked(not enabled)
+            return
+        self._info("已开启开机自启" if enabled else "已关闭开机自启")
 
     def _add_bookmark(self) -> None:
         folder = self._folder_of()

@@ -53,6 +53,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; 开机自启走 HKCU 的 Run 键：装在用户目录，不需要管理员；卸载时删掉这个值。
 ; `--tray` 是必须的——不带它每次登录都会弹一个窗口出来（见 __main__.start_hidden）。
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "NotionSync"; ValueData: """{app}\{#AppExeName}"" --tray"; Flags: uninsdeletevalue; Tasks: autostart
+; 设置页里的「开机自动启动」开关写的是同一条值，安装时没勾、后来在界面里打开也算数，
+; 所以卸载要无条件删一次。ValueType: none = 只登记"卸载时删掉"，安装时什么都不建。
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "NotionSync"; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppName}"; Flags: nowait postinstall skipifsilent
