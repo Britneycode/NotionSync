@@ -31,9 +31,11 @@ def scan_local(root: Path, config: dict) -> LocalSnapshot:
     include_spec = pathspec.PathSpec.from_lines("gitwildmatch", config["include"])
     exclude_spec = pathspec.PathSpec.from_lines("gitwildmatch", config["exclude"])
 
-    # 内置排除
+    # 内置排除。`.sync.*` 单独列出：`.sync-*` 匹配不到 .sync.lock / .sync.lock.json
+    # （审查报告 B4），include 放宽到 `**` 时它们会被扫描，触发自激同步。
     builtin_exclude = pathspec.PathSpec.from_lines("gitwildmatch", [
         ".sync-*",
+        ".sync.*",
         "*.sync-tmp",
         "__pycache__/",
     ])

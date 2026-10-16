@@ -538,6 +538,17 @@ def test_scanner_include_exclude(tmp_path):
     assert ".git/config" not in snapshot
 
 
+def test_scanner_builtin_excludes_sync_dot_files(tmp_path):
+    """内置排除含 .sync.*：锁文件不被扫描（include 放宽到 ** 也不自激）。"""
+    (tmp_path / ".sync.lock").write_text("pid")
+    (tmp_path / ".sync.lock.json").write_text("{}")
+    (tmp_path / "a.md").write_text("content")
+
+    snapshot = scan_local(tmp_path, {"include": ["**"], "exclude": []})
+
+    assert set(snapshot.files) == {"a.md"}
+
+
 def test_scanner_detect_format(tmp_path):
     (tmp_path / "test.md").write_bytes(b"\xef\xbb\xbfline1\r\nline2\r\n")
     config = {"include": ["*.md"], "exclude": []}
