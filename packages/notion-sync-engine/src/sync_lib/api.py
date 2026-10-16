@@ -9,7 +9,9 @@
 `canonical / scanner / remote / planner / plan / executor / state` 的算法未改。
 """
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -123,6 +125,11 @@ class _Context:
     config: dict
     state: StateManager
     remote: NotionRemote
+
+
+# 候选精读的并发度。按 Little 定律取 ⌈2.5 rps × p95 延迟⌉，3～4 个足够：
+# 吞吐被限流器封顶，多开的线程只会堆在令牌桶上排队，还把取消时的排空拖长（M3）。
+_CONCURRENT_READS = 4
 
 
 def _safe_save(state_mgr: StateManager):
@@ -564,8 +571,48 @@ def _load_context(
         notion.get("database_id"),
         notion.get("data_source_id"),
         cancel=cancel,
+        rate=config.get("rate_limit_rps", 2.5),
+        max_retries=config.get("max_retries", 6),
     )
     return _Context(root, config, state, remote)
+
+
+def _read_candidates(remote, candidates):
+    """并发精读候选页面，返回与 candidates 等长的三元组表（1.3）。
+
+    - 结果按候选原顺序回填：重复 Path 的胜出者与串行结果一致，计划指纹不抖（M3）。
+    - worker 只读远端，不碰 state；索引与 `remote_edited_at` 都由主线程写。
+    - 任一 worker 失败即 abort：队列里没开跑的读取直接丢掉，不再白发请求。
+      异常原样上浮——读失败这轮就是失败的，不能退化成「视为 R == BR」（B3）。
+    """
+    if not candidates:
+        return []
+
+    abort = threading.Event()
+
+    def read_one(cand):
+        # abort 必须在 worker 里就置位：ThreadPoolExecutor 的 worker 捕获异常后
+        # 会继续从队列取下一个任务，等主线程反应过来时队列早被抽空了。
+        if abort.is_set():
+            return None
+        try:
+            return remote.read_page(cand["id"])
+        except BaseException:
+            abort.set()
+            raise
+
+    results = [None] * len(candidates)
+    pool = ThreadPoolExecutor(max_workers=_CONCURRENT_READS)
+    try:
+        futures = {pool.submit(read_one, cand): i for i, cand in enumerate(candidates)}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    except BaseException:
+        abort.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return results
 
 
 def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
@@ -618,6 +665,8 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
             }
         )
 
+    # 先分流：回收站的只登记，其余才需要精读
+    targets = []
     for cand in candidates:
         path = cand.get("path")
         if not path:
@@ -626,7 +675,10 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
         if cand.get("in_trash"):
             remote_paths_trashed.add(path)
             continue
-        content, _block_id, valid = remote.read_page(cand["id"])
+        targets.append((path, cand))
+
+    reads = _read_candidates(remote, [cand for _path, cand in targets])
+    for (path, cand), (content, _block_id, valid) in zip(targets, reads):
         remote_index[path] = {
             "page_id": cand["id"],
             "hash": compute_hash(content) if valid else None,

@@ -2976,6 +2976,276 @@ def test_run_blocks_push_when_remote_changed(tmp_path, monkeypatch, command):
     assert on_disk["files"]["a.md"]["base_remote_hash"] == compute_hash("old")
 
 
+# --- 步骤 4（1.3）：候选 read_page 并发化（按审查报告 B3/M3 修正） ---
+
+
+def _candidate(page_id, path, last_edited="t"):
+    return {
+        "id": page_id,
+        "path": path,
+        "last_edited_time": last_edited,
+        "in_trash": False,
+    }
+
+
+def _index_state(files=None):
+    """给 _build_remote_index 用的最小 state_mgr：只要 .state 这个 dict。"""
+    mgr = Mock()
+    mgr.state = {"files": files or {}, "notion": {}}
+    return mgr
+
+
+def _empty_snapshot():
+    return LocalSnapshot()
+
+
+def test_remote_index_reads_candidates_in_parallel():
+    """候选精读并行进行：同一时刻有多个 worker 在途（串行实现恒为 1）。"""
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    workers = set()
+
+    def read_page(page_id):
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            workers.add(threading.current_thread().name)
+        try:
+            time.sleep(0.02)  # 留出重叠窗口，让并行的第二个 worker 能进来
+            return (page_id, "b1", True)
+        finally:
+            with lock:
+                in_flight -= 1
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        _candidate(f"p{i}", f"f{i}.md") for i in range(20)
+    ]
+    remote.read_page.side_effect = read_page
+
+    index, _trashed = api._build_remote_index(
+        remote, _index_state(), {}, _empty_snapshot(), False
+    )
+
+    assert len(index) == 20
+    assert peak >= 2
+    assert len(workers) >= 2
+
+
+def test_remote_index_duplicate_paths_keep_serial_winner():
+    """重复 Path：胜出者固定为候选顺序里的最后一个，与串行一致（M3）。
+
+    若边收边按 `as_completed` 写索引，先返回的那个会赢——随机延迟下每轮不同，
+    计划指纹跟着抖，界面会反复报 PLAN_CHANGED。
+    """
+    import random
+
+    for _ in range(50):
+        remote = Mock()
+        remote.query_candidates.return_value = [
+            _candidate("p1", "a.md"),
+            _candidate("p2", "a.md"),
+        ]
+
+        def read_page(page_id):
+            time.sleep(random.uniform(0, 0.002))
+            return (f"content-{page_id}", "b1", True)
+
+        remote.read_page.side_effect = read_page
+
+        index, _trashed = api._build_remote_index(
+            remote, _index_state(), {}, _empty_snapshot(), False
+        )
+        assert index["a.md"]["page_id"] == "p2"
+        assert index["a.md"]["hash"] == compute_hash("content-p2")
+
+
+def test_remote_index_read_failure_is_fatal_and_drops_queued():
+    """单个候选读失败 → 整轮致命上抛，排队中的读取被丢弃（B3/M3）。
+
+    失败候选既不能跳过（会落进「视为 R==BR」的合成分支、水位线照推、永久漏检），
+    也不能记 `struct_valid=False`（同样推进水位线）。必须让这一轮整体失败——
+    并且不能让队列里的 N 个请求继续白发出去。
+    """
+    files = {"f0.md": {}, "f1.md": {}}
+    calls = []
+
+    def read_page(page_id):
+        calls.append(page_id)
+        if page_id == "p2":
+            raise Exception("remote read failed")
+        time.sleep(0.05)
+        return ("x", "b1", True)
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        _candidate(f"p{i}", f"f{i}.md") for i in range(20)
+    ]
+    remote.read_page.side_effect = read_page
+    mgr = _index_state(files)
+
+    with pytest.raises(Exception, match="remote read failed"):
+        api._build_remote_index(remote, mgr, {}, _empty_snapshot(), False)
+
+    assert len(calls) <= 8  # 4 个 worker 各一次 + 收尾余量，远小于 20
+    # 读取没走完 → 连已经读到的候选也不回填，state 一个字节不动
+    assert files == {"f0.md": {}, "f1.md": {}}
+
+
+def test_run_read_failure_does_not_advance_watermark(tmp_path, monkeypatch):
+    """读失败的那一轮：不推进水位线、不动待吸收集合（B3）。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["notion"]["remote_watermark"] = "2026-01-01T00:00:00Z"
+    _write_state(tmp_path, state)
+
+    remote = Mock()
+    remote.query_candidates.return_value = [_candidate("p1", "a.md")]
+    remote.read_page.side_effect = Exception("remote read failed")
+
+    _patch_pipeline(monkeypatch, {}, remote=remote)
+
+    with pytest.raises(Exception, match="remote read failed"):
+        _sync(_Args("sync"))
+
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert on_disk["notion"]["remote_watermark"] == "2026-01-01T00:00:00Z"
+    assert "remote_dirty" not in on_disk["notion"]
+
+
+def test_cancelled_worker_leaves_no_threads_and_stops_requests():
+    """取消后：无残留 worker 线程，且取消后不再发新请求（M3）。"""
+    token = CancelToken()
+    calls = []
+
+    def read_page(page_id):
+        calls.append(page_id)
+        token.sleep(5)  # 真实远端在这里等令牌；取消会立刻打断
+        return ("x", "b1", True)
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        _candidate(f"p{i}", f"f{i}.md") for i in range(20)
+    ]
+    remote.read_page.side_effect = read_page
+
+    threading.Timer(0.05, token.cancel).start()
+
+    with pytest.raises(Cancelled):
+        api._build_remote_index(remote, _index_state(), {}, _empty_snapshot(), False)
+
+    assert 2 <= len(calls) <= 8  # 只有已在途的那几个，队列里的全被丢掉
+    assert not [t for t in threading.enumerate() if "ThreadPoolExecutor" in t.name]
+
+
+def test_remote_index_state_is_written_by_main_thread_only():
+    """worker 只读远端：state 的改动全部发生在主线程（1.3）。"""
+
+    class _Watcher(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.writers = set()
+
+        def __setitem__(self, key, value):
+            self.writers.add(threading.current_thread().name)
+            super().__setitem__(key, value)
+
+    entry = _Watcher({"page_id": "p1", "base_remote_hash": compute_hash("x")})
+    readers = set()
+
+    def read_page(page_id):
+        readers.add(threading.current_thread().name)
+        return ("x", "b1", True)
+
+    remote = Mock()
+    remote.query_candidates.return_value = [_candidate("p1", "a.md")]
+    remote.read_page.side_effect = read_page
+
+    index, _trashed = api._build_remote_index(
+        remote, _index_state({"a.md": entry}), {}, _empty_snapshot(), False
+    )
+
+    assert index["a.md"]["hash"] == compute_hash("x")
+    assert entry["remote_edited_at"] == "t"
+    assert entry.writers == {"MainThread"}
+    assert any(name.startswith("ThreadPoolExecutor") for name in readers)
+
+
+def test_rate_limiter_pause_holds_every_thread():
+    """429 全局冷却：冷却期内所有线程都拿不到令牌（M3）。
+
+    原方案里只有收到 429 的那个线程退避，其余线程照常请求，配额照超。
+    """
+    limiter = RateLimiter(rate=1000.0)  # 令牌给足：唯一的等待来源只能是冷却
+    limiter.pause(0.5)
+
+    start = time.monotonic()
+    limiter.wait()
+    # 冷却走 time.time()（Windows 上粒度约 15 ms），留出一点余量
+    assert time.monotonic() - start >= 0.4
+
+
+def test_notion_remote_429_triggers_global_cooldown():
+    """429 由 NotionRemote 转成限流器的全局冷却，时长取 Retry-After。"""
+    err = Exception("429")
+    err.headers = {"Retry-After": "2"}
+    mock_client = Mock()
+    mock_client.blocks.children.list.side_effect = [
+        err,
+        {"results": [_code_block_stub("b1", "x")], "has_more": False},
+    ]
+    remote = NotionRemote(mock_client, "db", "ds", rate=1000.0)
+    paused = []
+    remote.limiter.pause = paused.append  # 只观测「谁被冷却了、冷却多久」
+
+    with patch("time.sleep"):  # 退避本身不真睡，冷却另行验证
+        assert remote.read_page("p1")[2] is True
+
+    assert paused == [2]
+
+
+def test_rate_limiter_does_not_overissue_under_concurrency():
+    """并发取令牌不超发：4 个线程各取 1 个，仍受 20 rps 约束（≥3/20 秒）。"""
+    limiter = RateLimiter(rate=20.0)
+
+    start = time.monotonic()
+    threads = [threading.Thread(target=limiter.wait) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert time.monotonic() - start >= 0.14
+
+
+def test_load_context_applies_rate_limit_config(tmp_path, monkeypatch):
+    """配置里的 rate_limit_rps / max_retries 真的被用上（原为死参数）。"""
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    (tmp_path / ".sync-config.yaml").write_text(
+        "include: ['*.md']\nrate_limit_rps: 7.5\nmax_retries: 2\n"
+    )
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    ctx = api._load_context(
+        tmp_path, RunOptions(), CancelToken(), ConsoleReporter(sys.stdout)
+    )
+
+    assert ctx.remote.limiter.rate == 7.5
+    assert ctx.remote.max_retries == 2
+
+
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
     monkeypatch.chdir(tmp_path)

@@ -36,15 +36,26 @@ class RateLimiter:
         self.tokens = burst
         self.last_update = time.time()
         self.lock = Lock()
+        self.cooldown_until = 0.0  # 429 全局冷却的截止时刻
         # 等待函数可注入：同步流程传 CancelToken.sleep，等待期间可被取消。
         # 传 None 时在构造处解析 time.sleep，这样 `patch("time.sleep")` 仍然生效。
         self.waiter = waiter or time.sleep
+
+    def pause(self, seconds: float):
+        """429 全局冷却（M3）：所有线程一起停，而不是只有撞上 429 的那个线程退避"""
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time.time() + seconds)
 
     def wait(self):
         """等待直到有可用令牌"""
         with self.lock:
             while True:
                 now = time.time()
+                if now < self.cooldown_until:
+                    # 冷却期内不放行任何线程（也不消费令牌）
+                    self.waiter(self.cooldown_until - now)
+                    continue
+
                 elapsed = now - self.last_update
                 self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
                 self.last_update = now
@@ -58,8 +69,12 @@ class RateLimiter:
                 self.waiter(sleep_time)
 
 
-def retry_with_backoff(func, max_retries=6, base_delay=1.0, waiter=None):
-    """指数退避重试"""
+def retry_with_backoff(func, max_retries=6, base_delay=1.0, waiter=None, on_429=None):
+    """指数退避重试
+
+    `on_429(delay)`：撞上 429 时通知调用方，通常是让限流器全局冷却——
+    并发下拉取时只让当前线程退避，其余线程会照常越过配额（M3）。
+    """
     # 同上：在调用处解析 time.sleep，保证 `patch("time.sleep")` 依然拦得住
     waiter = waiter or time.sleep
     for attempt in range(max_retries):
@@ -83,23 +98,39 @@ def retry_with_backoff(func, max_retries=6, base_delay=1.0, waiter=None):
             else:
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
 
+            if on_429 is not None and "429" in error_msg:
+                on_429(delay)
+
             waiter(delay)
 
     raise Exception("Max retries exceeded")
 
 
 class NotionRemote:
-    def __init__(self, client: Client, database_id: str, data_source_id: str, cancel=None):
+    def __init__(
+        self,
+        client: Client,
+        database_id: str,
+        data_source_id: str,
+        cancel=None,
+        rate: float = 2.5,
+        max_retries: int = 6,
+    ):
         self.client = client
         self.database_id = database_id
         self.data_source_id = data_source_id
+        self.max_retries = max_retries
         # cancel 传入 CancelToken 时，限流与退避的等待都能被立刻打断
         self._waiter = cancel.sleep if cancel is not None else None
-        self.limiter = RateLimiter(rate=2.5, waiter=self._waiter)
+        self.limiter = RateLimiter(rate=rate, waiter=self._waiter)
 
     def _retry(self, func, **kwargs):
-        """retry_with_backoff 的实例包装：统一带上可取消的等待函数。"""
-        return retry_with_backoff(func, waiter=self._waiter, **kwargs)
+        """retry_with_backoff 的实例包装：统一带上可取消的等待函数、配置的重试次数，
+        以及 429 的全局冷却。"""
+        kwargs.setdefault("max_retries", self.max_retries)
+        return retry_with_backoff(
+            func, waiter=self._waiter, on_429=self.limiter.pause, **kwargs
+        )
 
     def _code_block(self, text: str, language: str) -> dict:
         """构造 code block（正文超出单块容量时由调用方拆成多个）"""
