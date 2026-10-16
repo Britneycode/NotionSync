@@ -18,4 +18,4 @@ build/
 
 # 本地资料与交接文件（留在本机，不推送）
 AGENTS.md
-docx/
+docs/
