@@ -261,9 +261,21 @@ def run(
                 done = index
 
             if not summary["failed"]:
-                ctx.state.state.setdefault("notion", {})[
-                    "remote_watermark"
-                ] = run_started
+                # 水位线与待吸收集合只在循环正常走完后更新——取消 / 失败时两者
+                # 都保持不变（不能放进 finally）。
+                notion = ctx.state.state.setdefault("notion", {})
+                files = ctx.state.state["files"]
+                notion["remote_dirty"] = sorted(
+                    p
+                    for p, r in remote_index.items()
+                    if r.get("fresh")
+                    and p in files
+                    and (
+                        not r["struct_valid"]
+                        or r["hash"] != files[p].get("base_remote_hash")
+                    )
+                )
+                notion["remote_watermark"] = run_started
                 ctx.state.save()
 
         if summary["failed"]:
@@ -522,11 +534,13 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
     - 非候选的已跟踪页面视为 R == BR。
     - 远端在回收站的 path 收进 remote_paths_trashed。
     - local 有但 remote_index 没有的 path，用 query_by_paths 探测 ADOPT 场景。
+    - 待吸收集合（notion.remote_dirty）里的 path 强制进候选，并标记 fresh。
 
     返回 (remote_index, remote_paths_trashed)。
     """
     state_files = state_mgr.state["files"]
-    watermark = state_mgr.state.get("notion", {}).get("remote_watermark")
+    notion = state_mgr.state.setdefault("notion", {})
+    watermark = notion.get("remote_watermark")
 
     remote_index = {}
     remote_paths_trashed = set()
@@ -545,6 +559,23 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
     else:
         candidates = remote.query_candidates(_watermark_since(watermark, config))
 
+    # 待吸收集合：上一轮远端有变更、但没被 PULL 吸收（勾选子集 / push / CONFLICT）
+    # 的页面。水位线推进后它们不再是候选，必须在这里强制读回，否则远端修改会被
+    # 永久漏检（B2）。
+    cand_ids = {c["id"] for c in candidates}
+    for path in notion.get("remote_dirty", []):
+        entry = state_files.get(path)
+        if not entry or not entry.get("page_id") or entry["page_id"] in cand_ids:
+            continue
+        candidates.append(
+            {
+                "id": entry["page_id"],
+                "path": path,
+                "last_edited_time": entry.get("remote_edited_at"),
+                "in_trash": False,
+            }
+        )
+
     for cand in candidates:
         path = cand.get("path")
         if not path:
@@ -559,6 +590,7 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
             "hash": compute_hash(content) if valid else None,
             "struct_valid": valid,
             "last_edited_time": cand.get("last_edited_time"),
+            "fresh": True,  # 本轮真实读过，dirty 集合只认这些条目
         }
         entry = state_files.get(path)
         if entry is not None:
@@ -590,6 +622,7 @@ def _build_remote_index(remote, state_mgr, config, local_snapshot, full):
                 "hash": compute_hash(content) if valid else None,
                 "struct_valid": valid,
                 "last_edited_time": None,
+                "fresh": True,
             }
 
     return remote_index, remote_paths_trashed

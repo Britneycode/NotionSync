@@ -2325,6 +2325,135 @@ def test_cmd_sync_no_watermark_on_errors(tmp_path, monkeypatch):
     assert "remote_watermark" not in state["notion"]
 
 
+def _write_dirty_config(tmp_path):
+    """配置 + 两个已跟踪文件，用于 B2 的 run 层用例。"""
+    _write_config(tmp_path)
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {
+                "a.md": {"page_id": "p1", "base_remote_hash": "BR_A"},
+                "b.md": {"page_id": "p2", "base_remote_hash": "BR_B"},
+            },
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+
+def _dirty_remote(content="changed"):
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        {"id": "p2", "path": "b.md", "last_edited_time": "new", "in_trash": False},
+    ]
+    remote.read_page.return_value = (content, "b1", True)
+    remote.query_by_paths.return_value = {}
+    return remote
+
+
+def test_run_records_unabsorbed_remote_change_in_dirty_set(tmp_path, monkeypatch):
+    """远端有变更但本轮未吸收（勾选子集 / push）→ 记入 remote_dirty，而非漏检。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_dirty_config(tmp_path)
+
+    # 过滤后的计划里只有 a.md：b.md 的 PULL 本轮没被执行
+    _patch_pipeline(
+        monkeypatch, {"a.md": Classification(Action.PUSH)}, remote=_dirty_remote()
+    )
+
+    result = _sync(_Args("sync"))
+
+    assert result.exit_code == EXIT.OK
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert state["notion"]["remote_dirty"] == ["b.md"]
+    assert state["notion"]["remote_watermark"].endswith("Z")
+
+
+def test_run_clears_dirty_set_when_remote_matches_baseline(tmp_path, monkeypatch):
+    """远端与基线一致（无未吸收变更）→ remote_dirty 为空列表。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {"a.md": {"page_id": "p1", "base_remote_hash": compute_hash("same")}},
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        {"id": "p1", "path": "a.md", "last_edited_time": "t", "in_trash": False},
+    ]
+    remote.read_page.return_value = ("same", "b1", True)
+    remote.query_by_paths.return_value = {}
+    _patch_pipeline(monkeypatch, {}, remote=remote)
+
+    _sync(_Args("sync"))
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert state["notion"]["remote_dirty"] == []
+
+
+def test_run_dirty_paths_are_rechecked_after_watermark_advance(tmp_path, monkeypatch):
+    """水位线推进后，dirty 路径仍被强制读回：下一轮照样发现远端变更（B2 不漏检）。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_dirty_config(tmp_path)
+
+    # 第一轮：b.md 是候选且已变更，但计划里没它（未吸收）
+    remote = _dirty_remote()
+    _patch_pipeline(monkeypatch, {"a.md": Classification(Action.PUSH)}, remote=remote)
+    _sync(_Args("sync"))
+
+    # 第二轮：水位线已推进，粗筛不再返回 b.md
+    remote.query_candidates.return_value = []
+    mocks, _ = _patch_pipeline(
+        monkeypatch, {"b.md": Classification(Action.PULL)}, remote=remote
+    )
+    _sync(_Args("sync"))
+
+    index = mocks["build_plan"].call_args[0][1]
+    assert index["b.md"]["hash"] == compute_hash("changed")
+
+
+def test_run_cancel_leaves_dirty_set_and_watermark_untouched(tmp_path, monkeypatch):
+    """取消：水位线不推进，dirty 集合原样保留。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_dirty_config(tmp_path)
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["notion"]["remote_watermark"] = "2026-10-14T00:00:00Z"
+    state["notion"]["remote_dirty"] = ["b.md"]
+    _write_state(tmp_path, state)
+
+    token = CancelToken()
+
+    def fake_execute(item, *a, **k):
+        token.cancel()  # 第一个文件跑完就取消
+        return Summary(errors=[])
+
+    from sync_lib import api as api_mod
+
+    _patch_pipeline(
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH), "b.md": Classification(Action.PUSH)},
+        remote=_dirty_remote(),
+    )
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    result = api_mod.run("sync", tmp_path, RunOptions(), ConsoleReporter(sys.stdout), token)
+
+    assert result.exit_code == EXIT.CANCELLED
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert state["notion"]["remote_watermark"] == "2026-10-14T00:00:00Z"
+    assert state["notion"]["remote_dirty"] == ["b.md"]
+
+
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
     monkeypatch.chdir(tmp_path)
@@ -2521,6 +2650,51 @@ def test_build_remote_index_non_candidate_uses_br(tmp_path):
         "struct_valid": True,
         "last_edited_time": "t2",
     }
+
+
+def test_build_remote_index_reads_dirty_paths_from_state(tmp_path):
+    """水位线推进后，remote_dirty 里的页面仍被强制读回（B2）。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {
+        "remote_watermark": "2026-10-14T00:00:00Z",
+        "remote_dirty": ["b.md"],
+    }
+    mgr.update_file(
+        "b.md",
+        {"page_id": "p2", "base_remote_hash": "BR2", "remote_edited_at": "t2"},
+    )
+
+    remote = Mock()
+    remote.query_candidates.return_value = []  # 粗筛因水位线推进漏掉它
+    remote.read_page.return_value = ("changed", "b2", True)
+
+    index, _ = api._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+
+    remote.read_page.assert_called_once_with("p2")
+    assert index["b.md"]["page_id"] == "p2"
+    assert index["b.md"]["hash"] == compute_hash("changed")
+    assert index["b.md"].get("fresh") is True
+
+
+def test_build_remote_index_marks_read_entries_fresh(tmp_path):
+    """本轮真实读回的条目标 fresh；「视为 R == BR」的合成条目不标。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.state["notion"] = {"remote_watermark": "2026-10-14T00:00:00Z"}
+    mgr.update_file("a.md", {"page_id": "p1", "base_remote_hash": "BR_A"})
+    mgr.update_file("b.md", {"page_id": "p2", "base_remote_hash": "BR_B"})
+
+    remote = Mock()
+    remote.query_candidates.return_value = [
+        {"id": "p1", "path": "a.md", "last_edited_time": "t", "in_trash": False},
+    ]
+    remote.read_page.return_value = ("content", "b1", True)
+
+    index, _ = api._build_remote_index(remote, mgr, {}, LocalSnapshot(), False)
+
+    assert index["a.md"].get("fresh") is True
+    assert not index["b.md"].get("fresh")
 
 
 def test_build_remote_index_probes_adopt(tmp_path):
