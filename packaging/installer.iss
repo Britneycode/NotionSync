@@ -12,7 +12,7 @@
 
 #define AppName "Notion 同步"
 #define AppExeName "NotionSync.exe"
-#define AppVersion "2.0.0"  ; 发版时与 apps/desktop/pyproject.toml 的 version 一起改
+#define AppVersion "2.1.0"  ; 发版时与 apps/desktop/pyproject.toml 的 version 一起改
 
 [Setup]
 AppId={{415B11D6-CD93-4509-BF85-D1323CEFF4E2}

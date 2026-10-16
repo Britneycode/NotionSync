@@ -326,7 +326,7 @@ wheels = [
 
 [[package]]
 name = "notion-sync-desktop"
-version = "2.0.0"
+version = "2.1.0"
 source = { editable = "apps/desktop" }
 dependencies = [
     { name = "notion-sync-engine" },
@@ -349,7 +349,7 @@ requires-dist = [
 
 [[package]]
 name = "notion-sync-engine"
-version = "1.3.0"
+version = "1.4.0"
 source = { editable = "packages/notion-sync-engine" }
 dependencies = [
     { name = "filelock" },

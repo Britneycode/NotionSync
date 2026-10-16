@@ -28,6 +28,7 @@ import sync_lib
 from sync_lib import credentials
 from sync_lib.protocol import PROTOCOL_VERSION
 
+from .. import __version__ as app_version
 from ..services import autostart
 from ..services.notion_theme import apply_theme as _apply_notion_theme
 from ..services.settings import UiSettings
@@ -70,6 +71,8 @@ class SettingsPage(QWidget):
     openFolderRequested = Signal(str)
     # 「文件夹变动自动同步」开关被拨动（主窗口据此起停监听）
     watchToggled = Signal(bool)
+    # 用户点了「检查更新」（查网络与弹提示都归主窗口管）
+    checkUpdateRequested = Signal()
 
     def __init__(self, folder_provider, parent=None):
         super().__init__(parent)
@@ -224,7 +227,8 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(4)
-        layout.addWidget(BodyLabel(f"引擎版本 {sync_lib.__version__}", card))
+        layout.addWidget(BodyLabel(f"版本 {app_version}", card))
+        layout.addWidget(CaptionLabel(f"引擎版本 {sync_lib.__version__}", card))
         layout.addWidget(CaptionLabel(f"事件协议版本 {PROTOCOL_VERSION}", card))
         layout.addWidget(
             CaptionLabel(
@@ -233,6 +237,14 @@ class SettingsPage(QWidget):
                 card,
             )
         )
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.checkUpdateButton = PushButton("检查更新", card)
+        self.checkUpdateButton.clicked.connect(self.checkUpdateRequested.emit)
+        row.addWidget(self.checkUpdateButton)
+        row.addStretch(1)
+        layout.addLayout(row)
         return card
 
     # ---------------------------------------------------------------- 状态

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QSystemTrayIcon, QWidget
 
 from notion_sync_desktop import main_window as mw
@@ -41,6 +41,28 @@ class StubEngine(QWidget):
         self.cancels += 1
 
     def is_running(self) -> bool:
+        return False
+
+
+class StubUpdateChecker(QObject):
+    """查更新用的替身：不联网也不起线程，结果由用例自己 emit。
+
+    刻意不是 QThread——真线程跑完就被 `deleteLater` 收走，用例再想往它身上
+    发结果就会撞上已删除的 C++ 对象。
+    """
+
+    result = Signal(str, str, str)
+    finished = Signal()
+
+    def __init__(self, local_version, fetcher=None, parent=None):
+        super().__init__(parent)
+        self.local_version = local_version
+        self.started = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def isRunning(self) -> bool:
         return False
 
 
@@ -98,6 +120,10 @@ def build_window(monkeypatch, tmp_path, tray: bool = False, runs=None):
 
     engine = StubEngine()
     monkeypatch.setattr(mw, "EngineClient", lambda parent=None: engine)
+    # 启动后会延迟查一次更新：测试里绝不真连 GitHub（离屏跑也不该有网络依赖），
+    # 延迟也置 0，免得每个用例白等 3 秒
+    monkeypatch.setattr(mw, "UpdateChecker", StubUpdateChecker)
+    monkeypatch.setattr(mw.MainWindow, "UPDATE_CHECK_DELAY_MS", 0)
     # 同步页查目标页面标题时自己会再起一个引擎进程，也挡住
     monkeypatch.setattr(sync_mod, "EngineClient", lambda parent=None: StubQueryEngine())
     return mw.MainWindow(), engine, tmp_path
@@ -505,3 +531,78 @@ def test_watch_toggle_stops_and_starts_the_watcher(window, qtbot):
     win.settings_page.watchSwitch.setChecked(True)
     (folder / "b.md").write_text("y", encoding="utf-8")
     qtbot.waitUntil(lambda: bool(engine.starts), timeout=8000)
+
+
+class _StubBar(QWidget):
+    """InfoBar 替身：记下 addWidget 塞进来的按钮，用例可以点它。
+
+    必须是真的 QWidget——生产代码会拿它当 parent 去建「去下载」按钮。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.widgets: list = []
+
+    def addWidget(self, widget):
+        self.widgets.append(widget)
+
+
+class _StubInfoBar:
+    def __init__(self):
+        self.calls: list[tuple[str, str, _StubBar]] = []
+
+    def _record(self, title, content="", **_kwargs):
+        bar = _StubBar()
+        self.calls.append((title, content, bar))
+        return bar
+
+    success = _record
+    warning = _record
+
+
+def test_new_version_pops_a_download_hint(window, qtbot, monkeypatch):
+    """有新版 → 提示条里带「去下载」，点它打开下载页。"""
+    win, _engine, _root = window
+    qtbot.waitUntil(lambda: win._update_checker is not None, timeout=1000)
+    bars = _StubInfoBar()
+    monkeypatch.setattr(mw, "InfoBar", bars)
+    opened = []
+    monkeypatch.setattr(
+        mw, "QDesktopServices",
+        type("_D", (), {"openUrl": staticmethod(lambda url: opened.append(url))}),
+    )
+
+    win._update_checker.result.emit("newer", "v2.1.0", "https://example.test/dl")
+    qtbot.waitUntil(lambda: bool(bars.calls), timeout=1000)
+
+    title, content, bar = bars.calls[-1]
+    assert "v2.1.0" in title
+    assert "覆盖升级" in content  # 说清下载后怎么装
+    bar.widgets[0].click()
+    assert [u.toString() for u in opened] == ["https://example.test/dl"]
+
+
+def test_automatic_update_check_is_silent_unless_there_is_a_new_version(
+    window, qtbot, monkeypatch
+):
+    """启动时那次自动检查不该打扰：已是最新或查不到都不弹。手动点才给反馈。"""
+    win, _engine, _root = window
+    qtbot.waitUntil(lambda: win._update_checker is not None, timeout=1000)
+    bars = _StubInfoBar()
+    monkeypatch.setattr(mw, "InfoBar", bars)
+
+    win._update_checker.result.emit("current", "v2.1.0", "")
+    win._update_checker.result.emit("error", "", "")
+    qtbot.wait(100)  # 信号是队列投递的，先让事件循环转一圈再断言「什么都没弹」
+    assert bars.calls == []
+
+    win.settings_page.checkUpdateButton.click()  # 手动检查：新的一次，要给反馈
+    qtbot.waitUntil(
+        lambda: win._update_checker is not None and not win._update_checker.isRunning(),
+        timeout=1000,
+    )
+    win._update_checker.result.emit("current", "v2.1.0", "")
+    win._update_checker.result.emit("error", "", "")
+    qtbot.waitUntil(lambda: len(bars.calls) == 2, timeout=1000)
+    assert "已是最新" in bars.calls[0][0]
+    assert "失败" in bars.calls[1][0]

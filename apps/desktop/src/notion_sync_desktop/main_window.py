@@ -4,6 +4,8 @@
 托盘、运行历史、单实例是 P4。
 """
 
+from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 from qfluentwidgets import (
     Action,
@@ -13,10 +15,13 @@ from qfluentwidgets import (
     InfoBarPosition,
     MessageBox,
     NavigationItemPosition,
+    PushButton,
     SystemTrayMenu,
 )
 
+from . import __version__ as app_version
 from .engine_client import EngineClient
+from .services.update_check import UpdateChecker
 from .services.watcher import SyncScheduler
 from .models.plan_model import PlanTableModel
 from .pages.history_page import HistoryPage
@@ -33,6 +38,9 @@ def tray_available() -> bool:
 
 
 class MainWindow(FluentWindow):
+    # 启动后隔这么久查一次更新：别和窗口首帧、首轮扫描抢时间（测试里置 0）
+    UPDATE_CHECK_DELAY_MS = 3000
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Notion 同步")
@@ -40,6 +48,7 @@ class MainWindow(FluentWindow):
 
         self._quitting = False
         self._tray_hint_shown = False
+        self._update_checker = None
         self.engine = EngineClient(self)
         self.plan_model = PlanTableModel(self)
         self.history = HistoryWriter()
@@ -76,6 +85,12 @@ class MainWindow(FluentWindow):
         self.sync_page.folderChanged.connect(self._on_folder_changed)
         self.settings_page.watchToggled.connect(self._on_watch_toggled)
         self._apply_watch_setting()
+
+        # 检查更新：启动后延迟查一次（别和窗口首帧、首轮扫描抢时间），用户也可手动点
+        self.settings_page.checkUpdateRequested.connect(
+            lambda: self._check_updates(manual=True)
+        )
+        QTimer.singleShot(self.UPDATE_CHECK_DELAY_MS, self._check_updates)
 
         self._init_tray()
 
@@ -148,6 +163,59 @@ class MainWindow(FluentWindow):
                 "引擎异常退出", "详细信息见日志", parent=self,
                 position=InfoBarPosition.TOP_RIGHT,
             )
+
+    # ------------------------------------------------------------ 检查更新
+
+    def _check_updates(self, manual: bool = False) -> None:
+        """查一次 GitHub Releases（仓库公开，匿名查即可）。
+
+        启动时那次只在真有新版时吭声；用户手动点「检查更新」三种结果都给反馈。
+        """
+        if self._update_checker is not None and self._update_checker.isRunning():
+            return
+        checker = UpdateChecker(app_version, self)
+        # 结果是从工作线程发出来的，接收者必须是主窗口自己的**方法**：包一层 lambda
+        # 就丢了线程归属，Qt 会直接在非 GUI 线程里调它，建 InfoBar 等于跨线程碰界面。
+        checker.result.connect(
+            self._on_manual_check_result if manual else self._on_auto_check_result
+        )
+        checker.finished.connect(self._on_check_finished)
+        self._update_checker = checker
+        checker.start()
+
+    def _on_check_finished(self) -> None:
+        # 清引用：线程对象被 deleteLater 收走后，再碰它的 isRunning() 会 RuntimeError
+        self._update_checker = None
+
+    def _on_auto_check_result(self, state: str, version: str, url: str) -> None:
+        """启动时那次：只有真有新版才吭声，其余（已最新 / 查不到）静默。"""
+        if state == "newer":
+            self._show_update_hint(version, url)
+
+    def _on_manual_check_result(self, state: str, version: str, url: str) -> None:
+        """用户手点的：三种结果都给反馈，否则点了没反应像卡住。"""
+        if state == "newer":
+            self._show_update_hint(version, url)
+        elif state == "current":
+            InfoBar.success(
+                f"已是最新版本（{app_version}）", "",
+                parent=self, position=InfoBarPosition.TOP_RIGHT, duration=4000,
+            )
+        else:
+            InfoBar.warning(
+                "检查更新失败", "网络不通，或 GitHub 暂时查不到，稍后再试",
+                parent=self, position=InfoBarPosition.TOP_RIGHT, duration=5000,
+            )
+
+    def _show_update_hint(self, version: str, url: str) -> None:
+        bar = InfoBar.success(
+            f"有新版本 {version}", f"当前 {app_version}，下载后直接安装即可覆盖升级",
+            parent=self, position=InfoBarPosition.TOP_RIGHT,
+            duration=-1, isClosable=True,
+        )
+        button = PushButton("去下载", bar)
+        button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
+        bar.addWidget(button)
 
     def _on_folder_changed(self, folder: str) -> None:
         """换了文件夹：监听跟着挪过去（自动同步永远作用于当前这个文件夹）。"""
