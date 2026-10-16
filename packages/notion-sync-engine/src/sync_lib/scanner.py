@@ -22,15 +22,12 @@ class LocalSnapshot:
         return self.files.keys()
 
 
-def scan_local(root: Path, config: dict) -> LocalSnapshot:
-    """扫描本地文件"""
-    root = Path(root)
-    snapshot = LocalSnapshot()
+def compile_scan_rules(config: dict):
+    """编译同步范围规则：内置排除 / 用户排除 / include（按此顺序判定）。
 
-    # 编译 pathspec 规则
-    include_spec = pathspec.PathSpec.from_lines("gitwildmatch", config["include"])
-    exclude_spec = pathspec.PathSpec.from_lines("gitwildmatch", config["exclude"])
-
+    扫描器、计划器与桌面端监听器都要按同一套规则判「这个路径归不归同步管」，
+    所以规则在这里只写一份（审查报告 B4）。
+    """
     # 内置排除。`.sync.*` 单独列出：`.sync-*` 匹配不到 .sync.lock / .sync.lock.json
     # （审查报告 B4），include 放宽到 `**` 时它们会被扫描，触发自激同步。
     builtin_exclude = pathspec.PathSpec.from_lines("gitwildmatch", [
@@ -39,6 +36,29 @@ def scan_local(root: Path, config: dict) -> LocalSnapshot:
         "*.sync-tmp",
         "__pycache__/",
     ])
+    return (
+        builtin_exclude,
+        pathspec.PathSpec.from_lines("gitwildmatch", config.get("exclude", [])),
+        pathspec.PathSpec.from_lines("gitwildmatch", config.get("include", [])),
+    )
+
+
+def in_scope(rel_path: str, rules) -> bool:
+    """rel_path 是否落在同步范围内（内置排除、用户排除、include 三关都过）。"""
+    builtin_exclude, exclude_spec, include_spec = rules
+    return not (
+        builtin_exclude.match_file(rel_path)
+        or exclude_spec.match_file(rel_path)
+        or not include_spec.match_file(rel_path)
+    )
+
+
+def scan_local(root: Path, config: dict) -> LocalSnapshot:
+    """扫描本地文件"""
+    root = Path(root)
+    snapshot = LocalSnapshot()
+
+    builtin_exclude, exclude_spec, include_spec = compile_scan_rules(config)
 
     # 遍历文件
     for file_path in root.rglob("*"):

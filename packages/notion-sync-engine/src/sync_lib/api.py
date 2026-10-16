@@ -27,6 +27,7 @@ from .executor import (
     Summary,
     backup_remote_content,
     execute_plan,
+    forget_file,
     resolve_conflict,
 )
 from .lock import LockBusy, RunLock
@@ -107,6 +108,7 @@ class RunOptions:
     # 批量裁决里的破坏性形态（keep=local 遇本地删、keep=remote 遇远端删）
     # 需要显式确认（M5）
     confirm_destructive: bool = False
+    force: bool = False  # forget：远端改过也照办（仍会先备份）
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +123,7 @@ class RunOptions:
             "only": len(self.only) if self.only is not None else None,
             "max_destructive": self.max_destructive,
             "confirm_destructive": self.confirm_destructive,
+            "force": self.force,
         }
 
 
@@ -247,6 +250,9 @@ def run(
                     started_at,
                     cancel,
                 )
+
+            if command == "forget":
+                return _run_forget(ctx, local_snapshot, opts, rep, summary, started_at)
 
             if opts.expect_plan and opts.expect_plan != fingerprint:
                 rep.emit(
@@ -440,6 +446,53 @@ def _run_pages(rep: Reporter, started_at: float) -> RunResult:
 
 
 _KEEP_LABELS = {"local": "本地", "remote": "远端", "merged": "合并后的本地"}
+
+
+def _run_forget(ctx, local_snapshot, opts: RunOptions, rep: Reporter, summary: dict, started_at):
+    """`forget <path>`：停止跟踪一个文件（备份远端 → 归档 → tombstone）。
+
+    这是设计 4.2 里「缩小 include 只是不再跟踪，真要移除远端才 forget」的那一步：
+    planner 对范围外的旧记录只报 UNTRACKED，清理动作留到这里显式执行。
+    """
+    path = opts.path
+    if not path:
+        raise SyncError("forget 需要指定路径", code="no-path")
+
+    rep.emit("phase", name="execute")
+    rep.emit("file.started", path=path, action="FORGET", index=1, total=1)
+    try:
+        backup = forget_file(path, ctx.state, ctx.remote, ctx.root, force=opts.force)
+    except Exception as e:
+        summary["failed"] += 1
+        rep.emit(
+            "file.finished",
+            path=path,
+            action="FORGET",
+            result="failed",
+            status="",
+            error=str(e),
+        )
+        return _finish(rep, EXIT.FAILED, summary, started_at, executed=True)
+
+    rep.emit(
+        "file.finished", path=path, action="FORGET", result="ok", status="", error=None
+    )
+    rep.emit("progress", done=1, total=1)
+    if path in local_snapshot.files:
+        rep.emit(
+            "warning",
+            code="still-in-scope",
+            message=(
+                f"注意：{path} 仍在同步范围内，下次同步会重新创建远端页；"
+                "要彻底停掉请同时把它移出 include 范围或删除本地文件"
+            ),
+        )
+    rep.emit(
+        "log",
+        level="info",
+        message=f"已忘记：{path}（远端已归档，原正文备份到 {backup}）",
+    )
+    return _finish(rep, EXIT.OK, summary, started_at, executed=True)
 
 
 def _resolve_targets(opts: RunOptions) -> list[str]:

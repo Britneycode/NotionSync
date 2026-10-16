@@ -4,8 +4,6 @@
 remote_index 由调用方（cmd_sync 编排）预先拉取后传入。
 """
 
-import pathspec
-
 from .canonical import normalize_path
 from .planner import (
     Action,
@@ -14,6 +12,7 @@ from .planner import (
     classify_file,
     detect_renames,
 )
+from .scanner import compile_scan_rules, in_scope
 
 
 def _normalize_files(mapping):
@@ -29,7 +28,8 @@ def build_plan(local_snapshot, remote_index, state, config, remote_paths_trashed
         remote_index:   {path: {page_id, hash, last_edited_time, struct_valid}}。
         state:          state["files"] 映射（path → 条目），含 base_local_hash /
                         base_remote_hash / page_id / status。
-        config:         配置字典，用 config["exclude"]（gitwildmatch）判定 out-of-scope。
+        config:         配置字典；include/exclude（gitwildmatch）+ 内置排除共同决定
+                        「路径是否归同步管」——不在范围内且 state 有记录的判 out-of-scope。
         remote_paths_trashed: 远端在回收站的 path 集合（视为远端不存在）。
 
     返回 {path: Classification}。除 SKIP / UNTRACKED 外每项均可执行；reason 供计划表展示。
@@ -39,7 +39,7 @@ def build_plan(local_snapshot, remote_index, state, config, remote_paths_trashed
     state_files = _normalize_files(state)
     trashed = {normalize_path(p) for p in (remote_paths_trashed or set())}
 
-    exclude_spec = pathspec.PathSpec.from_lines("gitwildmatch", config.get("exclude", []))
+    rules = compile_scan_rules(config)
 
     # 远端已修改的 path（远端 hash 与基线不同）→ rename 检测需跳过
     remote_changed = {
@@ -74,7 +74,10 @@ def build_plan(local_snapshot, remote_index, state, config, remote_paths_trashed
         if path in local_files:
             local_exists = True
             local_hash = local_files[path]["hash"]
-        elif exclude_spec.match_file(path):
+        elif in_state and not in_scope(path, rules):
+            # 「不在扫描范围内」与「用户删了」是两回事：缩小 include / 改 exclude /
+            # 命中内置排除时，文件只是不再归同步管，据此归档远端页会一次清掉一片
+            # （M6，设计 4.2）。真要移除远端请用 forget。
             local_exists = "out-of-scope"
             local_hash = None
         else:

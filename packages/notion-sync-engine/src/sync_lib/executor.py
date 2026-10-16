@@ -244,6 +244,34 @@ def _execute_archive_remote(path, state_mgr, remote):
     state_mgr.save()
 
 
+def forget_file(path, state_mgr, remote, local_root, force=False):
+    """停止跟踪一个文件：备份远端正文 → 归档远端页 → tombstone → 清 state 条目。
+
+    对应设计 4.2「规则变化只是不再跟踪，真要移除远端就 forget」。和 ARCHIVE_REMOTE
+    一样先做写前校验（6.6）：远端自基线后又有人改过就拒绝，除非显式 force——
+    那时也照样先把当前远端正文备份下来（M6）。本地文件不动。
+    """
+    entry = state_mgr.get_file(path)
+    if not entry or not entry.get("page_id"):
+        raise Exception(f"{path} 不在跟踪状态里")
+
+    content, _block_id, valid = remote.read_page(entry["page_id"])
+    if not valid:
+        raise Exception("remote invalid-structure")
+    if compute_hash(content) != entry.get("base_remote_hash") and not force:
+        raise Exception(
+            "Remote changed since baseline：先 pull / resolve 对齐，"
+            "或加 --force 强制忘记（会先把远端正文备份下来）"
+        )
+
+    backup = _write_remote_backup(path, content, local_root, subdir="forgotten")
+    remote.archive_page(entry["page_id"])
+    _add_tombstone(state_mgr, path, entry.get("page_id"), "remote")
+    del state_mgr.state["files"][path]
+    state_mgr.save()
+    return backup
+
+
 def _execute_delete_local(path, state_mgr, local_root):
     """执行 DELETE_LOCAL：远端已删、本地未改 → 本地文件移入备份并写 tombstone"""
     src = local_root / path
@@ -443,14 +471,15 @@ def backup_remote_content(path, remote, local_root, page_id) -> Path:
     return _write_remote_backup(path, content, local_root)
 
 
-def _write_remote_backup(path, content, local_root) -> Path:
-    """覆盖远端前先把远端文本备份到本地（设计 6.5 第 5 条）。
+def _write_remote_backup(path, content, local_root, subdir="conflicts") -> Path:
+    """覆盖/移除远端前先把远端文本备份到本地（设计 6.5 第 5 条）。
 
+    subdir 区分来路：resolve 覆盖前是 `conflicts`，forget 归档前是 `forgotten`。
     带时间戳：同一个文件可能被解决多次，不能互相覆盖。
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     ext = PurePosixPath(path).suffix
-    backup = local_root / ".sync-backup" / "conflicts" / f"{path}.remote-{timestamp}{ext}"
+    backup = local_root / ".sync-backup" / subdir / f"{path}.remote-{timestamp}{ext}"
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_text(content or "", encoding="utf-8")
     return backup

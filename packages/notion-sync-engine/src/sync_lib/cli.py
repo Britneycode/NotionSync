@@ -57,7 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="notion-sync", description="Notion 双向同步")
     # 只列引擎真正实现的命令；设计 §7.5 里的 forget/rebuild-state 尚未实现
     p.add_argument(
-        "command", choices=["init", "status", "push", "pull", "sync", "resolve", "pages"]
+        "command",
+        choices=["init", "status", "push", "pull", "sync", "resolve", "forget", "pages"],
     )
     p.add_argument(
         "path",
@@ -103,6 +104,11 @@ def main(argv: list[str] | None = None) -> int:
         "--confirm-destructive",
         action="store_true",
         help="确认批量裁决里的破坏性形态（归档远端 / 删本地）",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="forget：远端自基线后又改过也照办（仍会先把远端正文备份下来）",
     )
     a = p.parse_args(argv)
 
@@ -156,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         only=only,
         max_destructive=a.max_destructive,
         confirm_destructive=a.confirm_destructive,
+        force=a.force,
     )
     return run(a.command, a.root or Path.cwd(), opts, rep, cancel).exit_code
 

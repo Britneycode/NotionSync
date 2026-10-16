@@ -33,6 +33,7 @@ from sync_lib.executor import (
     _br_from_update_response,
     backup_remote_content,
     execute_plan,
+    forget_file,
     resolve_conflict,
 )
 from sync_lib.lock import LockBusy, RunLock
@@ -1878,16 +1879,21 @@ def test_build_plan_62_content_table(name, local_hash, remote_hash, struct_valid
 
 
 # 6.3 存在性分类表（删除与新增）
+
+_ALL_IN = {"include": ["**"], "exclude": []}  # 不做范围限制的配置
+
 PLAN_63_CASES = [
     # name, path, local_files, remote_index, state_files, config, expected
-    ("create_remote", "new.md", {"new.md": "h"}, {}, {}, {}, Action.CREATE_REMOTE),
+    # 计划器与扫描器共用同一套 include/exclude/builtin 规则，所以这里的 config
+    # 也要写完整（`_ALL_IN` = 不做范围限制）
+    ("create_remote", "new.md", {"new.md": "h"}, {}, {}, _ALL_IN, Action.CREATE_REMOTE),
     (
         "adopt_same",
         "a.md",
         {"a.md": "h"},
         {"a.md": _remote_entry(page_id="p9", hash="h")},
         {},
-        {},
+        _ALL_IN,
         Action.ADOPT,
     ),
     (
@@ -1896,17 +1902,17 @@ PLAN_63_CASES = [
         {"a.md": "h1"},
         {"a.md": _remote_entry(hash="h2")},
         {},
-        {},
+        _ALL_IN,
         Action.CONFLICT,
     ),
-    ("unmanaged", "x.md", {}, {"x.md": _remote_entry()}, {}, {}, Action.UNMANAGED),
+    ("unmanaged", "x.md", {}, {"x.md": _remote_entry()}, {}, _ALL_IN, Action.UNMANAGED),
     (
         "archive_remote",
         "a.md",
         {},
         {"a.md": _remote_entry(hash="b")},
         {"a.md": _state_entry(base_local="a", base_remote="b")},
-        {},
+        _ALL_IN,
         Action.ARCHIVE_REMOTE,
     ),
     (
@@ -1915,7 +1921,7 @@ PLAN_63_CASES = [
         {},
         {"a.md": _remote_entry(hash="c")},
         {"a.md": _state_entry(base_local="a", base_remote="b")},
-        {},
+        _ALL_IN,
         Action.CONFLICT,
     ),
     (
@@ -1924,7 +1930,7 @@ PLAN_63_CASES = [
         {"a.md": "a"},
         {},
         {"a.md": _state_entry(base_local="a", base_remote="b")},
-        {},
+        _ALL_IN,
         Action.DELETE_LOCAL,
     ),
     (
@@ -1933,10 +1939,10 @@ PLAN_63_CASES = [
         {"a.md": "c"},
         {},
         {"a.md": _state_entry(base_local="a", base_remote="b")},
-        {},
+        _ALL_IN,
         Action.CONFLICT,
     ),
-    ("delete_state", "a.md", {}, {}, {"a.md": _state_entry()}, {}, Action.DELETE_STATE),
+    ("delete_state", "a.md", {}, {}, {"a.md": _state_entry()}, _ALL_IN, Action.DELETE_STATE),
     (
         "untracked",
         "secrets/x.md",
@@ -1998,7 +2004,7 @@ def test_build_plan_rename_skipped_when_remote_changed():
         _snapshot({"new.md": "abc"}),
         {"old.md": _remote_entry(hash="changed")},
         {"old.md": _state_entry(page_id="p7", base_local="abc", base_remote="abc")},
-        {},
+        _ALL_IN,
     )
     # 远端已改 → 不判重命名；old.md 走存在性分类（本地消失、远端改了）→ CONFLICT
     assert plan["old.md"].action == Action.CONFLICT
@@ -3595,6 +3601,199 @@ def test_cli_passes_max_destructive(tmp_path, monkeypatch):
 
     assert code == EXIT.OK
     assert captured["opts"].max_destructive == 0
+
+
+# --- 步骤 6（3.x 闭环）：缩小 include 不再自动归档 + forget 命令 ---
+
+
+def test_build_plan_untracked_when_path_no_longer_included():
+    """缩小 include 后，state 里的旧记录判 UNTRACKED，不再自动归档远端页（M6）。
+
+    设计 4.2：规则变化导致「不在范围内」只是不再管，不等于「用户删了文件」。
+    """
+    plan = build_plan(
+        _snapshot({}),
+        {"old.md": _remote_entry(page_id="p1", hash="same")},
+        {"old.md": _state_entry(page_id="p1", base_local="same", base_remote="same")},
+        {"include": ["docs/**/*.md"], "exclude": []},
+    )
+    assert plan["old.md"].action == Action.UNTRACKED
+
+
+def test_build_plan_still_archives_when_included_file_deleted():
+    """守卫：文件仍在范围内、本地真没了 → 照旧 ARCHIVE_REMOTE，删除要传播。"""
+    plan = build_plan(
+        _snapshot({}),
+        {"old.md": _remote_entry(page_id="p1", hash="same")},
+        {"old.md": _state_entry(page_id="p1", base_local="same", base_remote="same")},
+        {"include": ["*.md"], "exclude": []},
+    )
+    assert plan["old.md"].action == Action.ARCHIVE_REMOTE
+
+
+def test_build_plan_untracked_when_builtin_excluded():
+    """内置排除命中的旧记录同样只判 UNTRACKED（监听器与扫描器共用同一套规则）。"""
+    plan = build_plan(
+        _snapshot({}),
+        {},
+        {".sync-state.json": _state_entry(page_id="p1", base_local="s", base_remote="s")},
+        {"include": ["**"], "exclude": []},
+    )
+    assert plan[".sync-state.json"].action == Action.UNTRACKED
+
+
+def _forget_record(tmp_path, *, content="remote text"):
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file(
+        "docs/old.md",
+        {
+            "page_id": "p1",
+            "block_id": "b1",
+            "base_local_hash": compute_hash("local text"),
+            "base_remote_hash": compute_hash(content),
+            "format": dict(FORMAT_LF),
+            "status": "synced",
+        },
+    )
+    return mgr
+
+
+def test_forget_archives_remote_and_writes_tombstone(tmp_path):
+    """forget：备份远端 → 归档 → tombstone → 清 state 条目；本地文件不动。"""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "old.md").write_text("local text", encoding="utf-8")
+    mgr = _forget_record(tmp_path)
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote text", "b1", True)
+
+    backup = forget_file("docs/old.md", mgr, remote, tmp_path)
+
+    assert backup.read_text(encoding="utf-8") == "remote text"
+    assert backup.parent == tmp_path / ".sync-backup" / "forgotten" / "docs"
+    remote.archive_page.assert_called_once_with("p1")
+    assert "docs/old.md" not in mgr.state["files"]
+    assert mgr.state["tombstones"]["docs/old.md"]["page_id"] == "p1"
+    # 本地文件不动：forget 是放弃跟踪，不是删文件
+    assert (tmp_path / "docs" / "old.md").read_text(encoding="utf-8") == "local text"
+
+
+def test_forget_rejects_when_remote_changed(tmp_path):
+    """远端自基线后又改过 → 拒绝，一个字节都不动（M6）。"""
+    mgr = _forget_record(tmp_path)
+
+    remote = Mock()
+    remote.read_page.return_value = ("collaborator edit", "b1", True)
+
+    with pytest.raises(Exception, match="Remote changed"):
+        forget_file("docs/old.md", mgr, remote, tmp_path)
+
+    remote.archive_page.assert_not_called()
+    assert "docs/old.md" in mgr.state["files"]
+    assert not (tmp_path / ".sync-backup").exists()
+
+
+def test_forget_force_backs_up_before_archiving(tmp_path):
+    """--force：远端改过也照办，但先把当前远端正文备份下来（M6）。"""
+    mgr = _forget_record(tmp_path)
+
+    remote = Mock()
+    remote.read_page.return_value = ("collaborator edit", "b1", True)
+
+    backup = forget_file("docs/old.md", mgr, remote, tmp_path, force=True)
+
+    assert backup.read_text(encoding="utf-8") == "collaborator edit"
+    remote.archive_page.assert_called_once_with("p1")
+
+
+def test_forget_rejects_invalid_structure_and_untracked(tmp_path):
+    mgr = _forget_record(tmp_path)
+    remote = Mock()
+    remote.read_page.return_value = (None, None, False)
+
+    with pytest.raises(Exception, match="invalid-structure"):
+        forget_file("docs/old.md", mgr, remote, tmp_path)
+
+    remote.archive_page.assert_not_called()
+
+    with pytest.raises(Exception, match="不在跟踪状态"):
+        forget_file("docs/other.md", mgr, remote, tmp_path)
+
+
+def test_run_forget_archives_and_reports(tmp_path, monkeypatch):
+    """走编排：forget 直接归档并收尾，不进执行循环。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    mgr = _forget_record(tmp_path)  # 复用同一份状态文件
+    mgr.save()
+
+    remote = Mock()
+    remote.query_candidates.return_value = []
+    remote.query_by_paths.return_value = {}
+    remote.read_page.return_value = ("remote text", "b1", True)
+
+    mocks, _ = _patch_pipeline(monkeypatch, {}, remote=remote)
+    monkeypatch.setattr(
+        api, "scan_local", Mock(return_value=_snapshot({"docs/old.md": "L"}))
+    )
+    log = _EventLog()
+
+    result = _sync(_Args("forget", path="docs/old.md"), reporter=log)
+
+    assert result.exit_code == EXIT.OK
+    remote.archive_page.assert_called_once_with("p1")
+    mocks["execute_plan"].assert_not_called()
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert "docs/old.md" not in on_disk["files"]
+    assert on_disk["tombstones"]["docs/old.md"]["page_id"] == "p1"
+    # 文件还在同步范围内 → 下次同步会重新建页，得说清楚
+    assert "重新" in log.first("warning")["message"]
+
+
+def test_run_forget_requires_path_and_reports_failure(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    remote = Mock()
+    remote.query_candidates.return_value = []
+    remote.query_by_paths.return_value = {}
+    remote.read_page.return_value = ("changed", "b1", True)
+    _patch_pipeline(monkeypatch, {}, remote=remote)
+
+    log = _EventLog()
+    result = _sync(_Args("forget", path=None), reporter=log)
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "no-path"
+
+    mgr = _forget_record(tmp_path)
+    mgr.save()
+    log2 = _EventLog()
+    failed = _sync(_Args("forget", path="docs/old.md"), reporter=log2)
+    assert failed.exit_code == EXIT.FAILED
+    assert "Remote changed" in log2.first("file.finished")["error"]
+
+
+def test_cli_parses_forget(tmp_path, monkeypatch):
+    from sync_lib import cli
+    from sync_lib.api import RunResult
+
+    captured = {}
+
+    def _fake_run(command, root, opts, rep, cancel):
+        captured["command"] = command
+        captured["opts"] = opts
+        return RunResult(EXIT.OK, {})
+
+    monkeypatch.setattr(cli, "run", _fake_run)
+    code = cli.main(["forget", "docs/a.md", "--root", str(tmp_path), "--force"])
+
+    assert code == EXIT.OK
+    assert captured["command"] == "forget"
+    assert captured["opts"].path == "docs/a.md"
+    assert captured["opts"].force is True
 
 
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
