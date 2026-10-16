@@ -242,20 +242,32 @@ class NotionRemote:
 
     def read_page(self, page_id):
         """读取页面正文（分页拉全 children，按块顺序拼接后做结构校验）"""
-        blocks = self._list_children(page_id)
-
-        # 结构校验：正文必须非空且全部由 code block 组成
-        if not blocks or any(b["type"] != "code" for b in blocks):
+        blocks, content, valid = self.read_blocks(page_id)
+        if not valid:
             return None, None, False
+
+        # 首块 id 作为状态里的 block_id：就地替换时保持稳定
+        return content, blocks[0]["id"], True
+
+    def read_blocks(self, page_id):
+        """读取页面全部子块并做结构校验，返回 (blocks, content, valid)。
+
+        结构校验：正文必须非空且全部由 code block 组成。
+
+        B1：写前校验与随后的 update_page_content 需要同一份列举结果，
+        由调用方把 blocks 透传给 update_page_content(existing=...)，
+        省掉背靠背的第二次整页列举。
+        """
+        blocks = self._list_children(page_id)
+        if not blocks or any(b["type"] != "code" for b in blocks):
+            return blocks, None, False
 
         content = "".join(
             rt["plain_text"]
             for block in blocks
             for rt in block["code"]["rich_text"]
         )
-
-        # 首块 id 作为状态里的 block_id：就地替换时保持稳定
-        return content, blocks[0]["id"], True
+        return blocks, content, True
 
     def update_block(self, block_id: str, content: str) -> dict:
         """替换单个 code block 的全部 rich_text 内容（按 UTF-16 码元切分，≤2000/段）"""
@@ -265,13 +277,16 @@ class NotionRemote:
             lambda: self.client.blocks.update(block_id=block_id, code={"rich_text": rich_text}),
         )
 
-    def update_page_content(self, page_id: str, content: str):
+    def update_page_content(self, page_id: str, content: str, existing=None):
         """把页面正文整体替换为 content，必要时增删 code block。
 
         返回写响应体；只有单块整页时才覆盖全文（可直接用于重算 BR），
         涉及多块或增删块时返回 None，由调用方读回远端重算。
+
+        existing 传入调用方刚拉到的子块时直接复用，省掉重复整页列举（B1）。
         """
-        existing = self._list_children(page_id)
+        if existing is None:
+            existing = self._list_children(page_id)
         if not existing or any(b["type"] != "code" for b in existing):
             return None
 

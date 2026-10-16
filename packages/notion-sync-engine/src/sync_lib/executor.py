@@ -116,8 +116,9 @@ def _execute_push(path, state_mgr, remote, local_root):
     state_mgr.set_pending(path, "push", content_hash)
     entry = state_mgr.get_file(path)
 
-    # 2. 写前校验（6.6）：结构异常 / 远端已改 → 中止并计入 errors
-    current_remote_content, _, valid = remote.read_page(entry["page_id"])
+    # 2. 写前校验（6.6）：结构异常 / 远端已改 → 中止并计入 errors。
+    #    B1：这份列举结果直接透传给第 3 步，省掉背靠背的第二次整页列举。
+    blocks, current_remote_content, valid = remote.read_blocks(entry["page_id"])
     if not valid:
         raise Exception("remote invalid-structure")
     if compute_hash(current_remote_content) != entry["base_remote_hash"]:
@@ -125,7 +126,7 @@ def _execute_push(path, state_mgr, remote, local_root):
 
     # 3. 执行更新（正文超单块容量时由远端拆/并 code block）；
     #    BR 优先取写响应体（5.5），否则读回，最后本地 hash 兜底
-    resp = remote.update_page_content(entry["page_id"], content)
+    resp = remote.update_page_content(entry["page_id"], content, existing=blocks)
     base_remote_hash = _br_from_update_response(resp, entry["block_id"], content)
     if base_remote_hash is None:
         read_back, _, read_valid = remote.read_page(entry["page_id"])

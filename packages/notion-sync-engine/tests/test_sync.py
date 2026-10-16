@@ -1010,8 +1010,11 @@ def test_execute_push(tmp_path):
 
     state_mgr = Mock()
     remote = Mock()
-    remote.read_page.return_value = ("old content", "block123", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("block123", "old content")], "old content", True,
+    )
     remote.update_page_content.return_value = {"last_edited_time": "2026-10-14T12:00:00Z"}
+    remote.read_page.return_value = ("new content", "block123", True)  # BR 读回
 
     # 最小改动：Mock 的 get_file 默认返回 Mock，无法下标访问；
     # 设为真实 dict 使写前校验通过（见 brief 授权）
@@ -1497,7 +1500,9 @@ def test_execute_push_uses_response_for_br(tmp_path):
     })
 
     remote = Mock()
-    remote.read_page.return_value = ("old content", "b1", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "old content")], "old content", True,
+    )
     remote.update_page_content.return_value = {
         "id": "b1",
         "type": "code",
@@ -1525,11 +1530,11 @@ def test_execute_push_br_fallback_readback(tmp_path):
     })
 
     remote = Mock()
-    # 第一次：写前校验；第二次：写响应不可用后的读回
-    remote.read_page.side_effect = [
-        ("old content", "b1", True),
-        ("new content", "b1", True),
-    ]
+    # 写前校验（read_blocks）与写响应不可用后的读回（read_page）各一次
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "old content")], "old content", True,
+    )
+    remote.read_page.return_value = ("new content", "b1", True)
     remote.update_page_content.return_value = {
         "id": "b1",
         "type": "code",
@@ -1555,7 +1560,7 @@ def test_execute_push_valid_false_records_error(tmp_path):
     })
 
     remote = Mock()
-    remote.read_page.return_value = (None, None, False)
+    remote.read_blocks.return_value = ([], None, False)
 
     plan = {"test.md": Classification(Action.PUSH)}
     summary = execute_plan(plan, mgr, remote, tmp_path, {})
@@ -1578,7 +1583,9 @@ def test_execute_push_optimistic_conflict(tmp_path):
     })
 
     remote = Mock()
-    remote.read_page.return_value = ("changed remotely", "b1", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "changed remotely")], "changed remotely", True,
+    )
 
     plan = {"test.md": Classification(Action.PUSH)}
     summary = execute_plan(plan, mgr, remote, tmp_path, {})
@@ -2753,6 +2760,222 @@ def test_run_status_persists_pending_recovery(tmp_path, monkeypatch):
     assert len(saves) == 1
 
 
+# --- 步骤 3（B1）：写前读回与整页替换合并为一次列举 ---
+#
+# 原方案 1.2（靠计划里的 meta 做写前校验、跳过执行期读回）会让校验恒真（B1），
+# 予以废弃。保留执行期读回，改为 read_blocks 的列举结果同时喂给写前校验与
+# update_page_content（existing=...），把背靠背的两次整页列举合并成一次。
+
+
+def _push_entry(**overrides):
+    """一个可 PUSH 的文件状态（基线：远端与本地都是 "old"）。"""
+    entry = {
+        "page_id": "p1",
+        "block_id": "b1",
+        "base_local_hash": compute_hash("old"),
+        "base_remote_hash": compute_hash("old"),
+        "format": "markdown",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_push_lists_page_once(tmp_path):
+    """单块页面 PUSH 只列举一次整页（原为 read_page + update_page_content 两次）。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "old")],
+        "has_more": False,
+    }
+    mock_client.blocks.update.return_value = {
+        "id": "b1",
+        "type": "code",
+        "code": {"rich_text": [{"plain_text": "new"}]},
+    }
+    remote = NotionRemote(mock_client, "db123", "ds123")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", _push_entry())
+    (tmp_path / "a.md").write_text("new", encoding="utf-8")
+
+    summary = execute_plan(
+        {"a.md": Classification(Action.PUSH)}, mgr, remote, tmp_path, {}
+    )
+
+    assert summary.errors == []
+    assert mock_client.blocks.children.list.call_count == 1
+    entry = mgr.get_file("a.md")
+    assert entry["base_local_hash"] == compute_hash("new")
+    assert entry["base_remote_hash"] == compute_hash("new")
+
+
+def test_push_blocks_when_remote_changed(tmp_path):
+    """写前校验必须真的能挡：远端内容 ≠ BR → 拒绝且一个写请求都不发。"""
+    mock_client = Mock()
+    mock_client.blocks.children.list.return_value = {
+        "results": [_code_block_stub("b1", "collaborator edit")],
+        "has_more": False,
+    }
+    remote = NotionRemote(mock_client, "db123", "ds123")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", _push_entry())
+    (tmp_path / "a.md").write_text("new", encoding="utf-8")
+
+    summary = execute_plan(
+        {"a.md": Classification(Action.PUSH)}, mgr, remote, tmp_path, {}
+    )
+
+    assert [e["error"] for e in summary.errors] == ["Remote changed during push"]
+    assert mock_client.blocks.update.call_count == 0
+    assert mock_client.blocks.children.append.call_count == 0
+    assert mock_client.blocks.delete.call_count == 0
+    assert mgr.get_file("a.md")["base_remote_hash"] == compute_hash("old")
+
+
+def test_update_page_content_reuses_existing_blocks_without_listing():
+    """existing 传入时不再列举整页；增块 / 减块行为与自列举时一致。"""
+    from sync_lib.remote import split_into_blocks
+
+    # 增块：单块 → 多块
+    mock_client = Mock()
+    mock_client.blocks.update.return_value = {"id": "b1", "type": "code", "code": {}}
+    remote = NotionRemote(mock_client, "db123", "ds123")
+
+    long_content = "x" * (MAX_BLOCK_UNITS + 1)
+    resp = remote.update_page_content(
+        "p1", long_content, existing=[_code_block_stub("b1", "old")]
+    )
+
+    assert resp is None  # 多块时必须读回重算 BR
+    assert mock_client.blocks.children.list.call_count == 0
+    assert mock_client.blocks.children.append.call_count == len(split_into_blocks(long_content)) - 1
+
+    # 减块：多块 → 单块
+    mock_client = Mock()
+    mock_client.blocks.update.return_value = {"id": "b1", "type": "code", "code": {}}
+    remote = NotionRemote(mock_client, "db123", "ds123")
+
+    resp = remote.update_page_content(
+        "p1", "short", existing=[_code_block_stub("b1", "a"), _code_block_stub("b2", "b")]
+    )
+
+    assert resp is None
+    assert mock_client.blocks.children.list.call_count == 0
+    assert mock_client.blocks.delete.call_args[1]["block_id"] == "b2"
+
+
+def test_push_read_back_after_block_count_change_matches_local(tmp_path):
+    """增块（写响应不可用）后读回重算的 BR 与本地内容一致。"""
+    from sync_lib.remote import split_into_blocks
+
+    long_content = "x" * (MAX_BLOCK_UNITS + 1)
+    chunks = split_into_blocks(long_content)
+    assert len(chunks) > 1
+
+    grown = [
+        _code_block_stub("b1", chunks[0]),
+        _code_block_stub("b2", chunks[1]),
+    ]
+    seen = {"n": 0}
+
+    def list_children(**kwargs):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return {"results": [_code_block_stub("b1", "old")], "has_more": False}
+        return {"results": grown, "has_more": False}
+
+    mock_client = Mock()
+    mock_client.blocks.children.list.side_effect = list_children
+    mock_client.blocks.update.return_value = {"id": "b1", "type": "code", "code": {}}
+    remote = NotionRemote(mock_client, "db123", "ds123")
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", _push_entry())
+    (tmp_path / "a.md").write_text(long_content, encoding="utf-8")
+
+    summary = execute_plan(
+        {"a.md": Classification(Action.PUSH)}, mgr, remote, tmp_path, {}
+    )
+
+    assert summary.errors == []
+    assert mock_client.blocks.children.list.call_count == 2  # 校验一次 + 写回读一次
+    entry = mgr.get_file("a.md")
+    assert entry["base_local_hash"] == compute_hash(long_content)
+    assert entry["base_remote_hash"] == compute_hash(long_content)
+
+
+def test_resolve_keep_local_still_checks_remote_change(tmp_path):
+    """resolve「保留本地」在重新定基线之后，push 仍校验「读→写」窗口内的远端变更。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    (tmp_path / "a.md").write_text("new", encoding="utf-8")
+
+    remote = Mock()
+    remote.read_page.return_value = ("remote v1", "b1", True)  # 定基线用
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "remote v2")],
+        "remote v2",
+        True,
+    )  # 窗口内协作者又改了一次
+
+    with pytest.raises(Exception, match="Remote changed during push"):
+        resolve_conflict("a.md", "local", mgr, remote, tmp_path, True, True, "p1")
+
+    assert remote.update_page_content.call_count == 0
+
+
+@pytest.mark.parametrize("command", ["sync", "push"])
+def test_run_blocks_push_when_remote_changed(tmp_path, monkeypatch, command):
+    """复现表场景 1/2：勾选子集 / push 命令下，远端执行期已改 → 拒绝且不写。
+
+    计划里的 PUSH 来自可能过时的远端索引；执行期的读回是最后一道闸。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["files"]["a.md"] = _push_entry()
+    _write_state(tmp_path, state)
+    (tmp_path / "a.md").write_text("new", encoding="utf-8")
+
+    remote = Mock()
+    remote.query_candidates.return_value = []
+    remote.query_by_paths.return_value = {}
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "collaborator edit")],
+        "collaborator edit",
+        True,
+    )
+
+    from sync_lib import api as api_mod
+
+    _patch_pipeline(
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH), "b.md": Classification(Action.PUSH)},
+        remote=remote,
+    )
+    monkeypatch.setattr(api_mod, "execute_plan", execute_plan)  # 用真实执行器
+
+    result = api_mod.run(
+        command,
+        tmp_path,
+        RunOptions(only=frozenset({"a.md"})),
+        ConsoleReporter(sys.stdout),
+        CancelToken(),
+    )
+
+    assert result.exit_code == EXIT.FAILED
+    assert result.summary["failed"] == 1
+    assert remote.update_page_content.call_count == 0
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert on_disk["files"]["a.md"]["base_remote_hash"] == compute_hash("old")
+
+
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
     monkeypatch.chdir(tmp_path)
@@ -3178,7 +3401,7 @@ def test_cancelled_escapes_execute_plan(tmp_path):
     )
 
     remote = Mock()
-    remote.read_page.side_effect = Cancelled()
+    remote.read_blocks.side_effect = Cancelled()
 
     with pytest.raises(Cancelled):
         execute_plan({"a.md": Classification(Action.PUSH)}, mgr, remote, tmp_path, {})
@@ -3709,6 +3932,9 @@ def test_resolve_keep_local_pushes_and_backs_up_remote(tmp_path):
 
     remote = Mock()
     remote.read_page.return_value = ("remote v2", "b1", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "remote v2")], "remote v2", True,
+    )
     remote.update_page_content.return_value = _write_response("b1", "local v2")
 
     result = resolve_conflict(
@@ -3742,10 +3968,10 @@ def test_resolve_keep_local_aborts_if_remote_changes_again(tmp_path):
 
     remote = Mock()
     # 第一次读：解决时备份 + 重定基线用；第二次读：_execute_push 的写前校验
-    remote.read_page.side_effect = [
-        ("remote v2", "b1", True),
-        ("remote v3", "b1", True),
-    ]
+    remote.read_page.return_value = ("remote v2", "b1", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "remote v3")], "remote v3", True,
+    )
 
     with pytest.raises(Exception, match="Remote changed during push"):
         resolve_conflict("a.md", "local", mgr, remote, tmp_path, True, True, "p1")
@@ -3789,6 +4015,9 @@ def test_resolve_keep_merged_pushes_local_like_local(tmp_path):
 
     remote = Mock()
     remote.read_page.return_value = ("remote v2", "b1", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b1", "remote v2")], "remote v2", True,
+    )
     remote.update_page_content.return_value = _write_response("b1", "merged result")
 
     result = resolve_conflict(
@@ -3811,6 +4040,9 @@ def test_resolve_keep_local_on_untracked_conflict_seeds_state(tmp_path):
 
     remote = Mock()
     remote.read_page.return_value = ("remote v2", "b9", True)
+    remote.read_blocks.return_value = (
+        [_code_block_stub("b9", "remote v2")], "remote v2", True,
+    )
     remote.update_page_content.return_value = _write_response("b9", "local v2")
 
     result = resolve_conflict(
