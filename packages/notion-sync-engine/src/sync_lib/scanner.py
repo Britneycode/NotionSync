@@ -70,12 +70,14 @@ def scan_local(root: Path, config: dict) -> LocalSnapshot:
             snapshot.skipped.append({"path": rel_path, "reason": f"read_error: {e}"})
             continue
 
-        # 检查大小
+        # 检查大小。块级拆分（remote.split_into_blocks）已能把一个文件的正文装进
+        # 一个 page 内的多个 code block，所以这里只挡「远超拆分能容纳」的极端文件，
+        # 不再用旧的 15 万（单块余量）当上限。
         text = raw.decode("utf-8-sig", errors="ignore")
         canonical_text = canonical(text)
         char_count = len(canonical_text.encode("utf-16-le")) // 2  # UTF-16 码元数
 
-        if char_count > config.get("max_chars", 150000):
+        if char_count > config.get("max_chars", 1_000_000):
             snapshot.skipped.append({
                 "path": rel_path,
                 "reason": "max_chars_exceeded",

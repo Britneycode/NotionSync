@@ -561,6 +561,52 @@ def test_scanner_skip_large_file(tmp_path):
     assert snapshot.skipped[0]["reason"] == "max_chars_exceeded"
 
 
+def test_scanner_accepts_file_over_old_150k_limit(tmp_path):
+    """超过旧 15 万上限但在新上限（默认 100 万）内的文本不再被整文件拒绝。
+
+    块级拆分能把它装进一个 page 的多个 code block，所以 scanner 不该拦。
+    """
+    large_content = "a" * 200_000  # 20 万码元，超旧 150_000、低于新默认 1_000_000
+    (tmp_path / "big.md").write_text(large_content)
+    config = {"include": ["*.md"], "exclude": []}  # 不显式给 max_chars，走新默认
+    snapshot = scan_local(tmp_path, config)
+
+    assert "big.md" in snapshot
+    assert snapshot.skipped == []
+
+
+def test_oversized_text_roundtrip_via_multiple_code_blocks(tmp_path):
+    """端到端：超 15 万的文本经 create_page 拆块、read_page 拼接，内容无损。"""
+    content = "中文🙂" * (MAX_BLOCK_UNITS // 4 + 1)  # 多块（中文+代理对，压边界）
+    assert len(content.encode("utf-16-le")) // 2 > 150_000  # 确实超旧上限
+
+    mock_client = Mock()
+    mock_client.pages.create.return_value = {"id": "page123"}
+    remote = NotionRemote(mock_client, "db123", "ds123")
+    remote.create_page("big.md", content, "markdown", "", len(content))
+
+    children = mock_client.pages.create.call_args[1]["children"]
+    assert len(children) > 1  # 拆成了多块
+    blocks = [
+        {
+            "id": f"block{i}",
+            "type": "code",
+            "code": {
+                "language": c["code"]["language"],
+                "rich_text": [{"plain_text": rt["text"]["content"]} for rt in c["code"]["rich_text"]],
+            },
+        }
+        for i, c in enumerate(children)
+    ]
+    mock_client.blocks.children.list.return_value = {"results": blocks, "has_more": False}
+
+    read_back, _, struct_valid = remote.read_page("page123")
+
+    assert struct_valid is True
+    assert read_back == content
+    assert compute_hash(read_back) == compute_hash(content)
+
+
 def test_scanner_path_normalization(tmp_path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "guide.md").write_text("test")

@@ -311,7 +311,7 @@ def _run_init(
             },
             "include": ["/*.md", "docs/**/*.md", "src/**/*.py"],
             "exclude": ["artifacts/", ".*/"],
-            "max_chars": 150000,
+            "max_chars": 1_000_000,
             "max_payload_kb": 450,
             "default_eol": "crlf",
             "rate_limit_rps": 2.5,
