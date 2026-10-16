@@ -5,6 +5,7 @@
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Signal
@@ -446,3 +447,61 @@ def test_declining_the_quit_confirmation_keeps_running(tray_window, monkeypatch)
     win.show()
     win.close()
     assert win.isHidden()
+
+
+# ------------------------------------------------------- 文件监听（2.3）
+
+
+def _init_folder(root):
+    """造一个「已初始化」的同步文件夹：配置 + 状态。"""
+    folder = root / "project"
+    folder.mkdir()
+    (folder / ".sync-config.yaml").write_text(
+        "include: ['*.md']\nexclude: []\n", encoding="utf-8"
+    )
+    (folder / ".sync-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "files": {},
+                "tombstones": {},
+                "notion": {"database_id": "db", "data_source_id": "ds"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return folder
+
+
+def test_folder_change_restarts_the_watcher(window, qtbot):
+    """换了文件夹，监听跟着换：新文件夹里的改动会自动触发一次增量同步。
+
+    启动时选的那个文件夹和后来拖进来的必须一视同仁，否则「自动同步」只在
+    重启后才对新文件夹生效。
+    """
+    win, engine, root = window
+    folder = _init_folder(root)
+
+    win.sync_page.set_folder(str(folder))
+    (folder / "note.md").write_text("hello", encoding="utf-8")
+
+    qtbot.waitUntil(lambda: bool(engine.starts), timeout=8000)
+    command, _root, flags = engine.starts[0]
+    assert command == "sync"
+    assert "--only-file" in flags
+    assert "note.md" in Path(flags[flags.index("--only-file") + 1]).read_text(encoding="utf-8")
+
+
+def test_watch_toggle_stops_and_starts_the_watcher(window, qtbot):
+    win, engine, root = window
+    folder = _init_folder(root)
+    win.sync_page.set_folder(str(folder))
+
+    win.settings_page.watchSwitch.setChecked(False)
+    (folder / "a.md").write_text("x", encoding="utf-8")
+    qtbot.wait(400)
+    assert engine.starts == []
+
+    win.settings_page.watchSwitch.setChecked(True)
+    (folder / "b.md").write_text("y", encoding="utf-8")
+    qtbot.waitUntil(lambda: bool(engine.starts), timeout=8000)

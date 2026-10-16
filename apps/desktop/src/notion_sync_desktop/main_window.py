@@ -17,6 +17,7 @@ from qfluentwidgets import (
 )
 
 from .engine_client import EngineClient
+from .services.watcher import SyncScheduler
 from .models.plan_model import PlanTableModel
 from .pages.history_page import HistoryPage
 from .pages.plan_page import PlanPage
@@ -68,6 +69,14 @@ class MainWindow(FluentWindow):
         # 计划页的命令一律经「同步」页发出，文件夹校验与日志只有一份
         self.plan_page.runRequested.connect(self._run_from_plan)
         self.settings_page.openFolderRequested.connect(self.open_folder)
+
+        # 文件监听（2.3）：本地一有改动就自动跑一次增量同步。默认开，设置页可关。
+        self.scheduler = SyncScheduler(self.engine, self.sync_page.folder, self)
+        self.sync_page.scheduler = self.scheduler
+        self.sync_page.folderChanged.connect(self._on_folder_changed)
+        self.settings_page.watchToggled.connect(self._on_watch_toggled)
+        self._apply_watch_setting()
+
         self._init_tray()
 
     # ------------------------------------------------------------ 事件分发
@@ -86,6 +95,10 @@ class MainWindow(FluentWindow):
             self.sync_page.append_log(
                 "info", f"计划已更新（{len(d.get('rows') or [])} 项）"
             )
+            # 只有用户自己的预览算「待执行」；自动同步自己发出来的计划若也按停
+            # 监听，它就会把自己的下一次触发锁死
+            self.plan_page.set_preview_pending(not self.scheduler.is_auto_running())
+            self._sync_watch_pause()
         elif t == "file.started":
             self.sync_page.set_current(d["path"], d["index"], d["total"])
         elif t == "file.finished":
@@ -129,11 +142,38 @@ class MainWindow(FluentWindow):
         # 「打开对比」的 `--backup-only` 跑完了，该拉 diff 了
         self.plan_page.on_run_finished(code)
         self.history_page.refresh()
+        self._sync_watch_pause()
         if crashed and code != 130:
             InfoBar.error(
                 "引擎异常退出", "详细信息见日志", parent=self,
                 position=InfoBarPosition.TOP_RIGHT,
             )
+
+    def _on_folder_changed(self, folder: str) -> None:
+        """换了文件夹：监听跟着挪过去（自动同步永远作用于当前这个文件夹）。"""
+        self.scheduler.stop()
+        if folder and self.settings_page.settings.watch_folder:
+            self.scheduler.start()
+
+    def _on_watch_toggled(self, enabled: bool) -> None:
+        if enabled:
+            self.scheduler.start()
+            self.sync_page.append_log("info", "已开启文件夹变动自动同步")
+        else:
+            self.scheduler.stop()
+            self.sync_page.append_log("info", "已关闭文件夹变动自动同步")
+
+    def _apply_watch_setting(self) -> None:
+        if self.settings_page.settings.watch_folder:
+            self.scheduler.start()
+
+    def _sync_watch_pause(self) -> None:
+        """计划表里摆着没执行的预览时暂停监听（M7）：监听一改本地文件，
+        那份计划的指纹就过期，用户点「执行」只会拿到 76。"""
+        if self.plan_page.has_pending_preview():
+            self.scheduler.pause()
+        else:
+            self.scheduler.resume()
 
     # ---------------------------------------------------------------- 托盘
 
@@ -174,6 +214,7 @@ class MainWindow(FluentWindow):
     def quit(self) -> None:
         """托盘菜单的「退出」：运行中先确认并取消，等进程退干净再关。"""
         self._quitting = True
+        self.scheduler.stop()
         if not self.engine.is_running():
             QApplication.quit()
             return
@@ -222,6 +263,7 @@ class MainWindow(FluentWindow):
                 self._notify("还在运行", "窗口已收进托盘，同步继续；要退出请用托盘菜单")
             return
         if not self.engine.is_running():
+            self.scheduler.stop()
             e.accept()
             return
         e.ignore()

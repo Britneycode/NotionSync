@@ -9,6 +9,7 @@ dependencies = [
   "platformdirs>=4",
   # 读文件夹里的 .sync-config.yaml（拿目标页面的 id）；引擎也是用它写这份配置的
   "pyyaml>=6",
+  "watchdog>=6.0.0",
 ]
 
 [project.gui-scripts]

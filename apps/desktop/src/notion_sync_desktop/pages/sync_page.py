@@ -67,18 +67,24 @@ class SyncPage(FolderDropArea):
     openSettingsRequested = Signal()
     # 「预览计划」不再自己跑命令：切到计划页由它去 `status`（P3）
     previewRequested = Signal()
+    # 当前文件夹真的换了（主窗口据此把文件监听挪到新文件夹）
+    folderChanged = Signal(str)
 
     def __init__(self, engine: EngineClient, parent=None):
         super().__init__(parent)
         self.setObjectName("syncPage")
         self.engine = engine
+        # 由主窗口注入（见 MainWindow.__init__）：用户命令要能压过自动运行
+        self.scheduler = None
         self.settings = UiSettings()
         self._running = False
+        self._queued: tuple[str, tuple[str, ...]] | None = None
         # integration 可见的页面（懒加载）：用来把目标 id 换成标题，也给选择器用
         self._pages: list[dict] | None = None
         self._querying = False
         self._pending_picker = False
         self._query: EngineClient | None = None
+        self._watched_folder = ""  # folderChanged 只在真的换了文件夹时才发
 
         self._build_ui()
         self._wire()
@@ -206,6 +212,7 @@ class SyncPage(FolderDropArea):
         self.pullButton.clicked.connect(lambda: self.run("pull"))
         self.previewButton.clicked.connect(self.previewRequested.emit)
         self.cancelButton.clicked.connect(self.engine.cancel)
+        self.engine.finished.connect(self._on_engine_finished)
 
     # ------------------------------------------------------------ 用户动作
 
@@ -221,6 +228,9 @@ class SyncPage(FolderDropArea):
     def refresh_folder_state(self) -> None:
         """按当前文件夹刷新「同步到」那一行，顺带把目标 id 换成标题。"""
         folder = self.folder()
+        if folder != self._watched_folder:
+            self._watched_folder = folder
+            self.folderChanged.emit(folder)
         self.targetCard.setVisible(bool(folder))
         target = read_target(folder) if folder else None
         if target is None:
@@ -250,6 +260,16 @@ class SyncPage(FolderDropArea):
             self.openSettingsRequested.emit()
             return
 
+        if self.engine.is_running():
+            # 用户操作优先（M7）：正在跑的是监听触发的自动运行就停掉它，等它退干净
+            # 再把用户的命令接上去；用户自己的运行照旧只提示。
+            if self.scheduler is not None and self.scheduler.cancel_auto():
+                self._queued = (command, flags)
+                self.append_log("info", "先停掉自动同步，随后执行你的命令…")
+                return
+            self._warn("已有任务在运行", "等它结束，或点「取消」")
+            return
+
         self.settings.last_folder = folder
         self.logView.clear()
         self.append_log("info", f"开始 {command}：{folder}")
@@ -257,6 +277,14 @@ class SyncPage(FolderDropArea):
             self.engine.start(command, folder, *flags)
         except RuntimeError as e:
             self._warn("已有任务在运行", str(e))
+
+    def _on_engine_finished(self, code: int, crashed: bool) -> None:
+        """运行结束：把刚才让路的用户命令接上。"""
+        if self._queued is None:
+            return
+        command, flags = self._queued
+        self._queued = None
+        self.run(command, *flags)
 
     # ------------------------------------------------------------ 目标页面
 

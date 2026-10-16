@@ -84,6 +84,16 @@ class UiSettings:
             self.save()
 
     @property
+    def watch_folder(self) -> bool:
+        """文件夹一有改动就自动跑一次增量同步（默认开）。"""
+        return bool(self._data.get("watch_folder", True))
+
+    @watch_folder.setter
+    def watch_folder(self, value: bool) -> None:
+        self._data["watch_folder"] = bool(value)
+        self.save()
+
+    @property
     def theme(self) -> str:
         value = self._data.get("theme")
         return value if value in THEMES else DEFAULT_THEME

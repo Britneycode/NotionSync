@@ -72,6 +72,7 @@ class PlanPage(QWidget):
         self._folder_of = folder_provider
         self._busy = False
         self._pending_diff: str | None = None
+        self._preview_pending = False  # 表里有还没执行的计划 → 主窗口暂停监听
         # 勾选清单的临时文件，跑完就删（见 _execute_plan / on_run_finished）
         self._only_file: Path | None = None
 
@@ -186,6 +187,16 @@ class PlanPage(QWidget):
         self._busy = busy
         self._sync_buttons()
 
+    def set_preview_pending(self, pending: bool) -> None:
+        """记录「表里摆着一份还没执行的计划」。主窗口据此暂停文件监听（M7）：
+
+        监听一旦改动本地文件，这份预览的指纹就过期，用户点「执行」只会拿到 76。
+        """
+        self._preview_pending = pending
+
+    def has_pending_preview(self) -> bool:
+        return self._preview_pending
+
     def on_run_finished(self, exit_code: int) -> None:
         """`--backup-only` 跑完就把对比窗口拉起来；顺便清掉勾选清单。"""
         if self._only_file is not None:
@@ -203,6 +214,7 @@ class PlanPage(QWidget):
         if not fingerprint:
             self._warn("还没有计划", "先点「重新预览」生成一份")
             return
+        self._preview_pending = False  # 这份预览被消费掉了，监听可以恢复
         flags = ["--expect-plan", fingerprint]
         picked = self._model.checked_paths()
         if picked is not None:  # 全勾时返回 None：不带清单，走原来的全量

@@ -68,6 +68,8 @@ class _TokenSaver(QThread):
 class SettingsPage(QWidget):
     # 书签里挑了一个：由主窗口切到「同步」页并把它设成当前文件夹
     openFolderRequested = Signal(str)
+    # 「文件夹变动自动同步」开关被拨动（主窗口据此起停监听）
+    watchToggled = Signal(bool)
 
     def __init__(self, folder_provider, parent=None):
         super().__init__(parent)
@@ -84,6 +86,7 @@ class SettingsPage(QWidget):
         root.addWidget(self._token_card())
         root.addWidget(self._theme_card())
         root.addWidget(self._startup_card())
+        root.addWidget(self._watch_card())
         root.addWidget(self._bookmark_card(), 1)
         root.addWidget(self._about_card())
 
@@ -159,6 +162,35 @@ class SettingsPage(QWidget):
         layout.addStretch(1)
         layout.addWidget(self.autostartSwitch)
         return card
+
+    def _watch_card(self) -> CardWidget:
+        card = CardWidget(self)
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(BodyLabel("文件夹变动自动同步", card))
+        text.addWidget(
+            CaptionLabel("本地一有改动就增量同步一次；不做归档/删除这类破坏性动作", card)
+        )
+
+        self.watchSwitch = SwitchButton(card)
+        self.watchSwitch.setOnText("开")
+        self.watchSwitch.setOffText("关")
+        # 先设值再接信号：否则这一步会被当成用户拨了开关而多存一次
+        self.watchSwitch.setChecked(self.settings.watch_folder)
+        self.watchSwitch.checkedChanged.connect(self._on_watch_toggled)
+
+        layout.addLayout(text)
+        layout.addStretch(1)
+        layout.addWidget(self.watchSwitch)
+        return card
+
+    def _on_watch_toggled(self, enabled: bool) -> None:
+        self.settings.watch_folder = enabled
+        self.watchToggled.emit(enabled)
 
     def _bookmark_card(self) -> CardWidget:
         card = CardWidget(self)

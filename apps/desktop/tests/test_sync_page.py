@@ -17,6 +17,8 @@ from notion_sync_desktop.widgets.folder_drop import first_local_dir
 class StubEngine(QWidget):
     """只记录被调了什么，不做任何事。"""
 
+    finished = Signal(int, bool)  # 运行结束（用户命令让路时页面要接上）
+
     def __init__(self):
         super().__init__()
         self.starts: list[tuple[str, str, tuple[str, ...]]] = []
