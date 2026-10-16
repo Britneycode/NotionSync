@@ -50,22 +50,21 @@ class StateManager:
         self.state["files"][path].update(updates)
 
     def set_pending(self, path: str, op: str, content_hash: str):
-        """设置 pending 意图"""
+        """设置 pending 意图。只改内存：落盘由调用方按批量节奏提交（1.1）"""
         self.state["files"][path]["pending"] = {
             "op": op,
             "content_hash": content_hash,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.save()
 
     def clear_pending(self, path: str):
-        """清除 pending"""
+        """清除 pending。只改内存，同 set_pending"""
         if path in self.state["files"]:
             self.state["files"][path]["pending"] = None
-            self.save()
 
     def recover_pending(self) -> list:
-        """启动时恢复 pending 记录"""
+        """启动时恢复 pending 记录。有恢复结果时显式落盘一次——
+        clear_pending 不再自己提交，残留的 pending 不能就这么留在磁盘上。"""
         recovered = []
         for path, entry in self.state["files"].items():
             pending = entry.get("pending")
@@ -83,6 +82,8 @@ class StateManager:
             elif op in ("archive", "delete-local", "rename"):
                 recovered.append({"path": path, "action": "check_target_state"})
 
+        if recovered:
+            self.save()
         return recovered
 
 

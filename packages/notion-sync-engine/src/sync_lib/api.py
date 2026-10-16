@@ -56,6 +56,17 @@ _NON_EXECUTABLE = {
     Action.DELETE_STATE,
 }
 
+# 主循环落盘节奏（1.1）：每处理这么多文件或这么久提交一次状态（先到为准），
+# 替代过去逐文件 fsync。强杀最多丢最后这么多文件的基线，下次运行按内容重新
+# 分类收敛（两侧同改判 BASELINE，CREATE 的 page_id 另行逐文件落盘，不会重复建页）。
+_FLUSH_EVERY_FILES = 20
+_FLUSH_EVERY_SECONDS = 2.0
+
+# 引擎所有 Notion 客户端的超时。必须小于桌面端的取消宽限期 CANCEL_GRACE_MS(15s)：
+# 取消时引擎至多卡在一次请求上，请求超时后主循环就能看到取消标记并正常收尾，
+# 而不是被强杀在半路（M1）。
+_HTTP_TIMEOUT_MS = 10_000
+
 
 class SyncError(Exception):
     """致命错误（配置缺失、无 token、未初始化等）。
@@ -112,6 +123,18 @@ class _Context:
     config: dict
     state: StateManager
     remote: NotionRemote
+
+
+def _safe_save(state_mgr: StateManager):
+    """异常路径上的尽力落盘。
+
+    save 自身也可能失败（比如 Windows 上 os.replace 撞上占用报 PermissionError）；
+    此时吞掉，不能让它顶替正在上浮的原始异常（M1）。
+    """
+    try:
+        state_mgr.save()
+    except Exception:
+        pass
 
 
 def run(
@@ -239,26 +262,45 @@ def run(
 
             items = sorted(filtered.items())
             total = len(items)
-            for index, (path, classification) in enumerate(items, 1):
-                cancel.check()
-                action = classification.action.name
-                rep.emit(
-                    "file.started", path=path, action=action, index=index, total=total
-                )
-                item_summary = execute_plan(
-                    {path: classification}, ctx.state, ctx.remote, root, ctx.config
-                )
-                _merge(summary, item_summary)
-                rep.emit(
-                    "file.finished",
-                    path=path,
-                    action=action,
-                    result="failed" if item_summary.errors else "ok",
-                    status="",
-                    error=item_summary.errors[0]["error"] if item_summary.errors else None,
-                )
-                rep.emit("progress", done=index, total=total)
-                done = index
+            last_flush_index = 0
+            last_flush_at = time.monotonic()
+            try:
+                for index, (path, classification) in enumerate(items, 1):
+                    cancel.check()
+                    action = classification.action.name
+                    rep.emit(
+                        "file.started", path=path, action=action, index=index, total=total
+                    )
+                    item_summary = execute_plan(
+                        {path: classification}, ctx.state, ctx.remote, root, ctx.config
+                    )
+                    _merge(summary, item_summary)
+                    rep.emit(
+                        "file.finished",
+                        path=path,
+                        action=action,
+                        result="failed" if item_summary.errors else "ok",
+                        status="",
+                        error=item_summary.errors[0]["error"] if item_summary.errors else None,
+                    )
+                    rep.emit("progress", done=index, total=total)
+                    done = index
+
+                    # 批量落盘：每 20 个文件或满 2 秒（先到为准）
+                    if (
+                        index - last_flush_index >= _FLUSH_EVERY_FILES
+                        or time.monotonic() - last_flush_at >= _FLUSH_EVERY_SECONDS
+                    ):
+                        ctx.state.save()
+                        last_flush_index = index
+                        last_flush_at = time.monotonic()
+            except BaseException:
+                # 取消 / 管道断开 / 任意异常：已完成的基线尽力落盘再原样上浮。
+                # 水位线不在这里更新——它只在循环正常走完后推进（见下）。
+                _safe_save(ctx.state)
+                raise
+            else:
+                ctx.state.save()
 
             if not summary["failed"]:
                 # 水位线与待吸收集合只在循环正常走完后更新——取消 / 失败时两者
@@ -312,7 +354,7 @@ def _run_init(
         if not opts.parent_page_id:
             raise SyncError("init 需要 --parent-page-id", code="no-parent")
 
-        client = Client(auth=token)
+        client = Client(auth=token, timeout_ms=_HTTP_TIMEOUT_MS)
         remote = NotionRemote(client, None, None)
         db_id, ds_id = remote.create_database(opts.parent_page_id)
 
@@ -356,7 +398,7 @@ def _run_pages(rep: Reporter, started_at: float) -> RunResult:
             # 沿用旧 CLI 的原文，保持文本输出兼容
             raise SyncError("错误：NOTION_TOKEN 未设置", code="no-token")
 
-        client = Client(auth=token)
+        client = Client(auth=token, timeout_ms=_HTTP_TIMEOUT_MS)
         remote = NotionRemote(client, None, None)
         rep.emit("pages", items=remote.search_pages())
     except SyncError as e:
@@ -516,7 +558,7 @@ def _load_context(
             "状态里没有 data_source_id，请先运行 notion-sync init", code="no-state"
         )
 
-    client = Client(auth=token)
+    client = Client(auth=token, timeout_ms=_HTTP_TIMEOUT_MS)
     remote = NotionRemote(
         client,
         notion.get("database_id"),

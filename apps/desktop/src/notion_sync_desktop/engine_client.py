@@ -34,7 +34,11 @@ class EngineClient(QObject):
     runningChanged = Signal(bool)
 
     # 发取消请求后等这么久；超时说明引擎卡在某个请求里，强杀。
-    # 强杀在数据上是安全的：写状态是原子的，锁由内核释放，未完成的文件下次 recover。
+    # 强杀在数据上是安全的：写状态是原子的（临时文件 + os.replace），锁由内核释放；
+    # 主循环按「每 20 个文件或 2 秒」批量落盘，强杀最多丢这一段的基线，下次运行
+    # 按内容重新分类收敛（两侧同改判 BASELINE；CREATE 的 page_id 逐文件落盘，
+    # 不会重复建页）。必须大于引擎的 HTTP 超时（api._HTTP_TIMEOUT_MS = 10s），
+    # 否则会在请求进行中强杀，白白多丢一批基线。
     CANCEL_GRACE_MS = 15_000
 
     def __init__(self, parent=None):

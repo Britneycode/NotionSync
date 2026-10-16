@@ -2465,6 +2465,294 @@ def test_run_cancel_leaves_dirty_set_and_watermark_untouched(tmp_path, monkeypat
     assert state["notion"]["remote_dirty"] == ["b.md"]
 
 
+# --- 步骤 2（1.1）：pending 批量落盘 + M1 异常/强杀加固 ---
+#
+# 契约变更：set_pending / clear_pending 不再逐文件落盘，基线由 api.run 主循环按
+# 「每 20 个文件或满 2 秒」批量提交；异常路径用 _safe_save 尽力落盘，但 save
+# 自身失败不得顶替原异常。CREATE 例外：page_id 与基线仍逐文件提交。
+
+
+def _count_saves(monkeypatch):
+    """统计 StateManager.save 的落盘次数（透传原实现）。"""
+    calls = []
+    original = StateManager.save
+
+    def counting(self):
+        calls.append(self.state_file)
+        return original(self)
+
+    monkeypatch.setattr(StateManager, "save", counting)
+    return calls
+
+
+class _FrozenClock:
+    """冻结的 time.monotonic 替身。
+
+    关掉「满 2 秒落盘」这条路径，让按文件数落盘的用例不受真实耗时影响。
+    `now` 可手工推进，用来构造「每个文件耗时 N 秒」的时间轴。
+    """
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
+class _BrokenPipeReporter:
+    """file.finished 时抛 BrokenPipeError，模拟前端管道断开。"""
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, type, **data):
+        if type == "file.finished":
+            raise BrokenPipeError("pipe closed")
+        self.events.append(type)
+
+
+def test_state_pending_changes_do_not_write_disk(tmp_path, monkeypatch):
+    """1.1：set_pending / clear_pending 只改内存，落盘交给调用方批量提交。"""
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    mgr.update_file("a.md", {"page_id": "p1"})
+
+    saves = _count_saves(monkeypatch)
+    mgr.set_pending("a.md", "push", "H")
+    mgr.clear_pending("a.md")
+
+    assert saves == []
+    assert not (tmp_path / ".sync-state.json").exists()
+
+
+def test_run_flushes_baselines_every_20_files(tmp_path, monkeypatch):
+    """1.1：批量落盘——第 21 个文件开始执行时，磁盘上恰好是前 20 个的基线。
+
+    等价于「处理第 21 个文件时被强杀」：磁盘状态不落后 20 个文件以上。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    from sync_lib import api as api_mod
+
+    monkeypatch.setattr(api_mod, "time", _FrozenClock())
+
+    plan = {f"f{i:02d}.md": Classification(Action.PUSH) for i in range(1, 26)}
+    seen_on_disk = {}
+
+    def fake_execute(item, state_mgr, *a, **k):
+        path = next(iter(item))
+        if path == "f21.md":
+            on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+            seen_on_disk.update(on_disk["files"])
+        state_mgr.update_file(path, {"base_local_hash": f"done-{path}"})
+        return Summary(errors=[])
+
+    _patch_pipeline(monkeypatch, plan)
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    _sync(_Args("sync"))
+
+    assert set(seen_on_disk) == {f"f{i:02d}.md" for i in range(1, 21)}
+    assert seen_on_disk["f20.md"]["base_local_hash"] == "done-f20.md"
+
+
+def test_run_flushes_baselines_by_time_before_20_files(tmp_path, monkeypatch):
+    """1.1：不足 20 个文件时按「满 2 秒」落盘（先到为准）。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    from sync_lib import api as api_mod
+
+    clock = _FrozenClock()
+    monkeypatch.setattr(api_mod, "time", clock)
+
+    plan = {f"f{i}.md": Classification(Action.PUSH) for i in range(1, 4)}
+    seen_on_disk = {}
+
+    def fake_execute(item, state_mgr, *a, **k):
+        path = next(iter(item))
+        if path == "f3.md":
+            on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+            seen_on_disk.update(on_disk["files"])
+        clock.now += 1.0  # 每个文件耗时 1 秒
+        state_mgr.update_file(path, {"base_local_hash": f"done-{path}"})
+        return Summary(errors=[])
+
+    _patch_pipeline(monkeypatch, plan)
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    _sync(_Args("sync"))
+
+    assert set(seen_on_disk) == {"f1.md", "f2.md"}
+
+
+def test_run_writes_state_three_times_for_20_pushes(tmp_path, monkeypatch):
+    """1.1：20 个 push 全程只落盘 3 次（批量 1 + 收尾 1 + 水位线 1），不再逐文件写。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    from sync_lib import api as api_mod
+
+    monkeypatch.setattr(api_mod, "time", _FrozenClock())
+
+    plan = {f"f{i:02d}.md": Classification(Action.PUSH) for i in range(1, 21)}
+
+    def fake_execute(item, state_mgr, *a, **k):
+        state_mgr.update_file(next(iter(item)), {"base_local_hash": "h"})
+        return Summary(errors=[])
+
+    _patch_pipeline(monkeypatch, plan)
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    saves = _count_saves(monkeypatch)
+    _sync(_Args("sync"))
+
+    assert len(saves) == 3
+
+
+def test_run_saves_completed_baselines_on_cancel(tmp_path, monkeypatch):
+    """M1：取消点在文件之间——已跑完的文件基线必须已落盘，水位线不推进。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["notion"]["remote_watermark"] = "2026-10-14T00:00:00Z"
+    _write_state(tmp_path, state)
+
+    from sync_lib import api as api_mod
+
+    monkeypatch.setattr(api_mod, "time", _FrozenClock())
+
+    token = CancelToken()
+
+    def fake_execute(item, state_mgr, *a, **k):
+        path = next(iter(item))
+        state_mgr.update_file(path, {"base_local_hash": f"done-{path}"})
+        if path == "b.md":
+            token.cancel()
+        return Summary(errors=[])
+
+    _patch_pipeline(
+        monkeypatch,
+        {
+            "a.md": Classification(Action.PUSH),
+            "b.md": Classification(Action.PUSH),
+            "c.md": Classification(Action.PUSH),
+        },
+    )
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    result = api_mod.run("sync", tmp_path, RunOptions(), ConsoleReporter(sys.stdout), token)
+
+    assert result.exit_code == EXIT.CANCELLED
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert on_disk["files"]["a.md"]["base_local_hash"] == "done-a.md"
+    assert on_disk["files"]["b.md"]["base_local_hash"] == "done-b.md"
+    assert "c.md" not in on_disk["files"]
+    assert on_disk["notion"]["remote_watermark"] == "2026-10-14T00:00:00Z"
+
+
+def test_run_flushes_state_when_reporter_dies(tmp_path, monkeypatch):
+    """M1：上报管道断开时基线仍已落盘，且 BrokenPipeError 照常上浮。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    from sync_lib import api as api_mod
+
+    def fake_execute(item, state_mgr, *a, **k):
+        path = next(iter(item))
+        state_mgr.update_file(path, {"base_local_hash": f"done-{path}"})
+        return Summary(errors=[])
+
+    _patch_pipeline(
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH), "b.md": Classification(Action.PUSH)},
+    )
+    monkeypatch.setattr(api_mod, "execute_plan", fake_execute)
+
+    with pytest.raises(BrokenPipeError):
+        api_mod.run("sync", tmp_path, RunOptions(), _BrokenPipeReporter(), CancelToken())
+
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert on_disk["files"]["a.md"]["base_local_hash"] == "done-a.md"
+
+
+def test_safe_save_does_not_mask_original_exception(tmp_path, monkeypatch):
+    """M1：异常路径上 save 自身失败（如 os.replace 报 PermissionError）不能顶替原异常。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    from sync_lib import api as api_mod
+
+    def boom(self):
+        raise PermissionError("state file locked")
+
+    monkeypatch.setattr(StateManager, "save", boom)
+    _patch_pipeline(
+        monkeypatch,
+        {"a.md": Classification(Action.PUSH), "b.md": Classification(Action.PUSH)},
+    )
+
+    with pytest.raises(BrokenPipeError):
+        api_mod.run("sync", tmp_path, RunOptions(), _BrokenPipeReporter(), CancelToken())
+
+
+def test_execute_create_still_saves_twice_per_file(tmp_path, monkeypatch):
+    """1.1：批量落盘不削弱 CREATE——page_id 与基线仍逐文件提交（20 个 = 40 次）。"""
+    remote = Mock()
+    remote.read_page.return_value = ("body", "blk", True)
+
+    mgr = StateManager(tmp_path)
+    mgr.load()
+    saves = _count_saves(monkeypatch)
+
+    for i in range(1, 21):
+        path = f"c{i:02d}.md"
+        (tmp_path / path).write_text("hello", encoding="utf-8")
+        remote.create_page.return_value = f"page-{i}"
+        execute_plan(
+            {path: Classification(Action.CREATE_REMOTE)}, mgr, remote, tmp_path, {}
+        )
+
+    assert len(saves) == 40
+
+
+def test_run_status_persists_pending_recovery(tmp_path, monkeypatch):
+    """1.1：clear_pending 不再落盘——恢复结果必须由 recover_pending 显式提交一次。
+
+    status 是只读命令，主循环与水位线都不落盘，所以磁盘上的 pending 只能来自
+    这一步；写盘次数恰好 1。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["files"]["a.md"] = {
+        "page_id": "p1",
+        "base_local_hash": "H",
+        "base_remote_hash": "H",
+        "pending": {"op": "push", "content_hash": "H", "started_at": "t"},
+    }
+    _write_state(tmp_path, state)
+
+    _patch_pipeline(monkeypatch, {})
+    saves = _count_saves(monkeypatch)
+
+    _sync(_Args("status"))
+
+    on_disk = json.loads((tmp_path / ".sync-state.json").read_text())
+    assert on_disk["files"]["a.md"]["pending"] is None
+    assert len(saves) == 1
+
+
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):
     """push 计划含 PULL/CONFLICT → 警告，且这些项不执行。"""
     monkeypatch.chdir(tmp_path)
@@ -3135,7 +3423,8 @@ def test_api_run_pages_emits_the_items(tmp_path, monkeypatch):
     from sync_lib import api as api_mod
 
     monkeypatch.setattr(api_mod, "get_token", lambda: ("tok", "env"))
-    monkeypatch.setattr(api_mod, "Client", lambda auth: Mock())
+    # Client 现在带 timeout_ms（M1），替身需要吞掉关键字参数
+    monkeypatch.setattr(api_mod, "Client", lambda auth, **kwargs: Mock())
     remote = Mock()
     remote.search_pages.return_value = [{"id": "p1", "title": "工作台", "url": "u"}]
     monkeypatch.setattr(api_mod, "NotionRemote", lambda *a, **k: remote)
