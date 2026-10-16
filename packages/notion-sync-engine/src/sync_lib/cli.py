@@ -92,6 +92,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="resolve 只把远端内容落盘成对比用的副本，不做裁决",
     )
+    p.add_argument(
+        "--max-destructive",
+        type=int,
+        default=None,
+        help="本轮允许的破坏性动作（归档远端 / 删本地）上限；"
+        "监听等自动运行传 0。默认不限",
+    )
+    p.add_argument(
+        "--confirm-destructive",
+        action="store_true",
+        help="确认批量裁决里的破坏性形态（归档远端 / 删本地）",
+    )
     a = p.parse_args(argv)
 
     cancel = CancelToken()
@@ -142,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         keep=a.keep,
         backup_only=a.backup_only,
         only=only,
+        max_destructive=a.max_destructive,
+        confirm_destructive=a.confirm_destructive,
     )
     return run(a.command, a.root or Path.cwd(), opts, rep, cancel).exit_code
 

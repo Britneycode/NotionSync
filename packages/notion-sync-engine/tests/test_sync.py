@@ -2035,7 +2035,16 @@ class _Args:
     """一次运行的参数命名空间（对齐 api.RunOptions）。"""
 
     def __init__(
-        self, command, dry_run=False, full=False, path=None, keep=None, backup_only=False
+        self,
+        command,
+        dry_run=False,
+        full=False,
+        path=None,
+        keep=None,
+        backup_only=False,
+        only=None,
+        max_destructive=None,
+        confirm_destructive=False,
     ):
         self.command = command
         self.dry_run = dry_run
@@ -2043,6 +2052,9 @@ class _Args:
         self.path = path
         self.keep = keep
         self.backup_only = backup_only
+        self.only = only
+        self.max_destructive = max_destructive
+        self.confirm_destructive = confirm_destructive
 
 
 def _sync(args, root=None, reporter=None):
@@ -2060,6 +2072,9 @@ def _sync(args, root=None, reporter=None):
         path=args.path,
         keep=args.keep,
         backup_only=args.backup_only,
+        only=args.only,
+        max_destructive=args.max_destructive,
+        confirm_destructive=args.confirm_destructive,
     )
     return run(
         args.command,
@@ -3244,6 +3259,342 @@ def test_load_context_applies_rate_limit_config(tmp_path, monkeypatch):
 
     assert ctx.remote.limiter.rate == 7.5
     assert ctx.remote.max_retries == 2
+
+
+# --- 步骤 5：破坏性动作闸（原方案 2.1 的替代，B4/M4）+ 批量裁决（2.2，M5） ---
+
+
+def _destructive_plan(count):
+    return {f"f{i}.md": Classification(Action.ARCHIVE_REMOTE) for i in range(count)}
+
+
+def _run_sync(root, opts, reporter=None):
+    return api.run(
+        "sync", root, opts, reporter or JsonlReporter(io.StringIO(), "r"), CancelToken()
+    )
+
+
+def test_run_blocks_more_destructive_actions_than_allowed(tmp_path, monkeypatch):
+    """破坏性动作超过 max_destructive → 一项都不执行，退出码 2（B4/M4）。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, _destructive_plan(2))
+    log = _EventLog()
+
+    result = _run_sync(tmp_path, RunOptions(max_destructive=1), log)
+
+    assert result.exit_code == EXIT.NEEDS_ATTENTION
+    mocks["execute_plan"].assert_not_called()
+    assert "file.started" not in log.types()
+    warning = log.first("warning")
+    assert warning["code"] == "too-destructive"
+    assert "2" in warning["message"] and "1" in warning["message"]
+
+
+def test_run_allows_destructive_actions_within_limit(tmp_path, monkeypatch):
+    """没超上限就照常执行——闸门不是禁止破坏性动作，而是给它们封顶。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, _destructive_plan(2))
+
+    result = _run_sync(tmp_path, RunOptions(max_destructive=2))
+
+    assert result.exit_code == EXIT.OK
+    assert mocks["execute_plan"].call_count == 2
+
+
+def test_run_counts_only_the_selected_subset(tmp_path, monkeypatch):
+    """阈值按**本轮要执行的项**算：勾选子集只统计子集里的破坏性动作。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    mocks, _ = _patch_pipeline(monkeypatch, _destructive_plan(3))
+
+    result = _run_sync(
+        tmp_path, RunOptions(max_destructive=1, only=frozenset({"f0.md"}))
+    )
+
+    assert result.exit_code == EXIT.OK
+    assert mocks["execute_plan"].call_count == 1
+
+
+def test_run_blocks_empty_scan_with_tracked_state(tmp_path, monkeypatch):
+    """扫到 0 个文件、state 里还有已跟踪记录 → 拒绝执行（B4/M4）。
+
+    root 被换掉 / 网络盘没挂上 / include 配错时，这一轮会把远端整库归档。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["files"] = {
+        "a.md": {"page_id": "p1", "base_local_hash": "L", "base_remote_hash": "R"},
+        "b.md": {"page_id": "p2", "base_local_hash": "L", "base_remote_hash": "R"},
+    }
+    _write_state(tmp_path, state)
+
+    mocks, _ = _patch_pipeline(monkeypatch, _destructive_plan(2))
+    log = _EventLog()
+
+    result = _run_sync(tmp_path, RunOptions(), log)  # 没给上限（默认不限）
+
+    assert result.exit_code == EXIT.NEEDS_ATTENTION
+    mocks["execute_plan"].assert_not_called()
+    assert log.first("warning")["code"] == "too-destructive"
+
+
+def test_run_allows_empty_scan_when_limit_is_explicit(tmp_path, monkeypatch):
+    """显式给了 max_destructive 就是「我知道自己在干什么」，按阈值放行。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+    state = json.loads((tmp_path / ".sync-state.json").read_text())
+    state["files"] = {"a.md": {"page_id": "p1"}}
+    _write_state(tmp_path, state)
+
+    mocks, _ = _patch_pipeline(monkeypatch, _destructive_plan(1))
+
+    result = _run_sync(tmp_path, RunOptions(max_destructive=1))
+
+    assert result.exit_code == EXIT.OK
+    assert mocks["execute_plan"].call_count == 1
+
+
+def _resolve_batch_env(tmp_path, monkeypatch, plan, *, local=None):
+    """批量 resolve 的编排环境：每条计划路径都在 state 里有 conflict 记录。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOTION_TOKEN", "tok")
+    _write_config(tmp_path)
+
+    _write_state(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "files": {
+                path: {
+                    "page_id": f"p-{path}",
+                    "block_id": "b1",
+                    "base_local_hash": "L0",
+                    "base_remote_hash": "R0",
+                    "format": dict(FORMAT_LF),
+                    # 状态跟着计划走：非冲突行不能靠 status=conflict 混过预校验
+                    "status": (
+                        "conflict"
+                        if plan[path].action == Action.CONFLICT
+                        else "synced"
+                    ),
+                }
+                for path in plan
+            },
+            "tombstones": {},
+            "notion": {"database_id": "db", "data_source_id": "ds"},
+        },
+    )
+
+    mocks, remote = _patch_pipeline(monkeypatch, plan)
+    if local is None:
+        local = list(plan)
+    monkeypatch.setattr(
+        api, "scan_local", Mock(return_value=_snapshot({p: "L" for p in local}))
+    )
+    return mocks, remote
+
+
+@pytest.mark.parametrize(
+    "second,keep,code",
+    [
+        (Classification(Action.PUSH), "local", "not-conflict"),
+        (Classification(Action.CONFLICT), "merged", "bad-keep"),
+    ],
+    ids=["not-a-conflict", "merged-with-one-side-gone"],
+)
+def test_resolve_batch_precheck_rejects_whole_batch(
+    tmp_path, monkeypatch, second, keep, code
+):
+    """整批预校验：任何一条不合法，都在执行任何一项之前拒绝（M5）。
+
+    否则会执行一半、以退出码 3 收尾且没有摘要。
+    """
+    plan = {"a.md": Classification(Action.CONFLICT), "b.md": second}
+    _resolve_batch_env(tmp_path, monkeypatch, plan, local=["a.md"])
+
+    result, mock, log = _run_resolve(
+        monkeypatch, path=None, keep=keep, only=frozenset({"a.md", "b.md"})
+    )
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == code
+    mock.assert_not_called()
+    assert "file.started" not in log.types()
+
+
+def test_resolve_batch_continues_after_one_failure(tmp_path, monkeypatch):
+    """单项失败不拖累其余项：全批走完，退出码 1，摘要准确（M5）。"""
+    plan = {p: Classification(Action.CONFLICT) for p in ("a.md", "b.md", "c.md")}
+    _resolve_batch_env(tmp_path, monkeypatch, plan)
+
+    done = []
+
+    def fake_resolve(path, *args, **kwargs):
+        if path == "b.md":
+            raise Exception("boom")
+        done.append(path)
+        return ResolveResult(Summary(errors=[]), None)
+
+    result, mock, log = _run_resolve(
+        monkeypatch,
+        path=None,
+        keep="local",
+        only=frozenset(plan),
+        side_effect=fake_resolve,
+    )
+
+    assert done == ["a.md", "c.md"]
+    assert mock.call_count == 3
+    assert result.exit_code == EXIT.FAILED
+    assert result.summary["failed"] == 1
+    failed = [
+        e["data"]["path"]
+        for e in log.events
+        if e["type"] == "file.finished" and e["data"]["result"] == "failed"
+    ]
+    assert failed == ["b.md"]
+
+
+def test_resolve_batch_emits_progress_per_item(tmp_path, monkeypatch):
+    """每条都要有 file.started / file.finished / progress，界面才画得出进度。"""
+    plan = {"a.md": Classification(Action.CONFLICT), "b.md": Classification(Action.CONFLICT)}
+    _resolve_batch_env(tmp_path, monkeypatch, plan)
+
+    outcome = ResolveResult(Summary(errors=[]), None)
+    result, _mock, log = _run_resolve(
+        monkeypatch,
+        path=None,
+        keep="local",
+        only=frozenset(plan),
+        return_value=outcome,
+    )
+
+    assert result.exit_code == EXIT.OK
+    assert log.types().count("file.started") == 2
+    assert log.types().count("file.finished") == 2
+    assert [e["data"] for e in log.events if e["type"] == "progress"] == [
+        {"done": 1, "total": 2},
+        {"done": 2, "total": 2},
+    ]
+
+
+def test_resolve_batch_destructive_needs_confirmation(tmp_path, monkeypatch):
+    """「保留本地」遇「本地删、远端改」= 归档远端：批量裁决要求显式确认（M5）。"""
+    plan = {"a.md": Classification(Action.CONFLICT), "b.md": Classification(Action.CONFLICT)}
+    _resolve_batch_env(tmp_path, monkeypatch, plan, local=["a.md"])  # b.md 本地已删
+
+    result, mock, log = _run_resolve(
+        monkeypatch, path=None, keep="local", only=frozenset(plan)
+    )
+
+    assert result.exit_code == EXIT.FATAL
+    assert log.first("warning")["code"] == "destructive-resolve"
+    mock.assert_not_called()
+
+    outcome = ResolveResult(Summary(errors=[]), None)
+    confirmed, mock2, _log2 = _run_resolve(
+        monkeypatch,
+        path=None,
+        keep="local",
+        only=frozenset(plan),
+        confirm_destructive=True,
+        return_value=outcome,
+    )
+
+    assert confirmed.exit_code == EXIT.OK
+    assert mock2.call_count == 2
+
+
+def test_resolve_batch_cancelled_midway(tmp_path, monkeypatch):
+    """批次中途取消：不再执行后续项，返回 130。"""
+    plan = {p: Classification(Action.CONFLICT) for p in ("a.md", "b.md", "c.md")}
+    _resolve_batch_env(tmp_path, monkeypatch, plan)
+
+    token = CancelToken()
+    calls = []
+
+    def fake_resolve(path, *args, **kwargs):
+        calls.append(path)
+        token.cancel()  # 第一项跑完就来取消
+        return ResolveResult(Summary(errors=[]), None)
+
+    monkeypatch.setattr(api, "resolve_conflict", Mock(side_effect=fake_resolve))
+    log = _EventLog()
+
+    result = api.run(
+        "resolve",
+        tmp_path,
+        RunOptions(path=None, keep="local", only=frozenset(plan)),
+        log,
+        token,
+    )
+
+    assert calls == ["a.md"]
+    assert result.exit_code == EXIT.CANCELLED
+
+
+def test_cli_resolve_accepts_only_file_and_confirm_flag(tmp_path, monkeypatch):
+    from sync_lib import cli
+    from sync_lib.api import RunResult
+
+    listing = tmp_path / "only.txt"
+    listing.write_text("a.md\n\nb.md\n", encoding="utf-8")
+    captured = {}
+
+    def _fake_run(command, root, opts, rep, cancel):
+        captured["command"] = command
+        captured["opts"] = opts
+        return RunResult(EXIT.OK, {})
+
+    monkeypatch.setattr(cli, "run", _fake_run)
+    code = cli.main(
+        [
+            "resolve",
+            "--root",
+            str(tmp_path),
+            "--keep",
+            "local",
+            "--only-file",
+            str(listing),
+            "--confirm-destructive",
+        ]
+    )
+
+    assert code == EXIT.OK
+    opts = captured["opts"]
+    assert captured["command"] == "resolve"
+    assert opts.path is None
+    assert opts.only == frozenset({"a.md", "b.md"})
+    assert opts.confirm_destructive is True
+    assert opts.keep == "local"
+
+
+def test_cli_passes_max_destructive(tmp_path, monkeypatch):
+    from sync_lib import cli
+    from sync_lib.api import RunResult
+
+    captured = {}
+
+    def _fake_run(command, root, opts, rep, cancel):
+        captured["opts"] = opts
+        return RunResult(EXIT.OK, {})
+
+    monkeypatch.setattr(cli, "run", _fake_run)
+    code = cli.main(["sync", "--root", str(tmp_path), "--max-destructive", "0"])
+
+    assert code == EXIT.OK
+    assert captured["opts"].max_destructive == 0
 
 
 def test_cmd_sync_push_warns_on_remote_changes(tmp_path, monkeypatch, capsys):

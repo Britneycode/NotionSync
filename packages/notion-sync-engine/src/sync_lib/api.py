@@ -58,6 +58,9 @@ _NON_EXECUTABLE = {
     Action.DELETE_STATE,
 }
 
+# 会真丢东西的动作：远端归档 / 本地删除。`max_destructive` 只数这两类（M4）
+_DESTRUCTIVE_ACTIONS = {Action.ARCHIVE_REMOTE, Action.DELETE_LOCAL}
+
 # 主循环落盘节奏（1.1）：每处理这么多文件或这么久提交一次状态（先到为准），
 # 替代过去逐文件 fsync。强杀最多丢最后这么多文件的基线，下次运行按内容重新
 # 分类收敛（两侧同改判 BASELINE，CREATE 的 page_id 另行逐文件落盘，不会重复建页）。
@@ -98,6 +101,12 @@ class RunOptions:
     keep: str | None = None  # resolve 的裁决：local / remote / merged
     backup_only: bool = False  # resolve 只落远端副本，不做裁决
     only: frozenset[str] | None = None  # 只执行这些路径（POSIX 相对）；None = 全量
+    # 本轮允许的破坏性动作（远端归档 / 本地删除）上限；None = 不限。
+    # 自动触发的运行传 0：一个破坏性动作都不许做（B4/M4）
+    max_destructive: int | None = None
+    # 批量裁决里的破坏性形态（keep=local 遇本地删、keep=remote 遇远端删）
+    # 需要显式确认（M5）
+    confirm_destructive: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +119,8 @@ class RunOptions:
             "backup_only": self.backup_only,
             # 只记条数：事件流会被写进运行历史，几百个路径没必要跟着一起落盘
             "only": len(self.only) if self.only is not None else None,
+            "max_destructive": self.max_destructive,
+            "confirm_destructive": self.confirm_destructive,
         }
 
 
@@ -226,7 +237,15 @@ def run(
 
             if command == "resolve":
                 return _run_resolve(
-                    ctx, plan, local_snapshot, remote_index, opts, rep, summary, started_at
+                    ctx,
+                    plan,
+                    local_snapshot,
+                    remote_index,
+                    opts,
+                    rep,
+                    summary,
+                    started_at,
+                    cancel,
                 )
 
             if opts.expect_plan and opts.expect_plan != fingerprint:
@@ -244,6 +263,11 @@ def run(
                 # 所以「预览后内容又变了」照样会在执行前被挡下。
                 filtered = {p: c for p, c in filtered.items() if p in opts.only}
             filtered, escape_errors = _check_local_containment(filtered, root)
+
+            blocked = _destructive_guard(filtered, local_snapshot, ctx.state, opts)
+            if blocked is not None:
+                rep.emit("warning", code="too-destructive", message=blocked)
+                return _finish(rep, EXIT.NEEDS_ATTENTION, summary, started_at)
 
             # 需要用户处理的计划项：CONFLICT / BLOCKED。注意不能读 summary["conflicts"]
             # ——它来自 execute_plan，而 CONFLICT 被 _filter_plan 挡在执行之外，
@@ -418,6 +442,82 @@ def _run_pages(rep: Reporter, started_at: float) -> RunResult:
 _KEEP_LABELS = {"local": "本地", "remote": "远端", "merged": "合并后的本地"}
 
 
+def _resolve_targets(opts: RunOptions) -> list[str]:
+    """本轮的裁决目标：勾选清单（批量）优先，其次是单个路径。"""
+    if opts.only is not None:
+        return sorted(opts.only)
+    if opts.path:
+        return [opts.path]
+    raise SyncError("resolve 需要指定要解决的路径", code="no-path")
+
+
+def _resolve_is_destructive(keep, local_exists, remote_exists) -> bool:
+    """这次裁决是不是真会删东西（设计 6.5 表格里的两种破坏性形态）：
+
+    「保留本地」遇本地已删 = 归档远端；「保留远端」遇远端已删 = 删本地。
+    """
+    if keep == "local":
+        return not local_exists
+    if keep == "remote":
+        return not remote_exists
+    return False
+
+
+def _precheck_resolve(targets, plan, ctx, local_snapshot, remote_index, opts):
+    """整批预校验（M5）：任何一条不合法，都在执行任何一项之前拒绝整批。
+
+    否则会执行到一半、以退出码 3 收尾，且没有摘要。
+
+    返回 [(path, local_exists, remote_exists, page_id)]。
+    """
+    batch = len(targets) > 1
+    prepared = []
+    for path in targets:
+        classification = plan.get(path)
+        if classification is None:
+            raise SyncError(f"{path} 不在当前计划里", code="not-in-plan")
+        # 已经解决过、状态仍是 conflict 的项会被分类成 BLOCKED，所以两种都接受；
+        # 但 BLOCKED 里还有"远端结构异常"，那种不是冲突，不能放行。
+        if (
+            classification.action != Action.CONFLICT
+            and ctx.state.get_file(path).get("status") != "conflict"
+        ):
+            raise SyncError(
+                f"{path} 当前不是冲突（{classification.action.name}），无需解决",
+                code="not-conflict",
+            )
+
+        local_exists = path in local_snapshot.files
+        remote_exists = path in remote_index
+        page_id = ctx.state.get_file(path).get("page_id") or (
+            remote_index[path]["page_id"] if remote_exists else None
+        )
+
+        if opts.backup_only and not remote_exists:
+            raise SyncError(
+                f"{path}: 远端没有这个页面，没有可对比的远端副本", code="no-remote"
+            )
+        if opts.keep == "merged" and not (local_exists and remote_exists):
+            raise SyncError(
+                f"{path} 两侧不是都有文件，没有可合并的版本", code="bad-keep"
+            )
+        # 破坏性形态（会归档远端 / 删本地）在批量裁决里要显式确认——
+        # 一键「全部保留本地」碰到本地已删的项，等于一键批量归档远端页。
+        if (
+            batch
+            and not opts.confirm_destructive
+            and _resolve_is_destructive(opts.keep, local_exists, remote_exists)
+        ):
+            raise SyncError(
+                f"{path}：保留「{_KEEP_LABELS[opts.keep]}」会"
+                f"{'归档远端页面' if opts.keep == 'local' else '删除本地文件'}，"
+                "批量裁决需要 --confirm-destructive 显式确认",
+                code="destructive-resolve",
+            )
+        prepared.append((path, local_exists, remote_exists, page_id))
+    return prepared
+
+
 def _run_resolve(
     ctx: _Context,
     plan: dict,
@@ -427,88 +527,78 @@ def _run_resolve(
     rep: Reporter,
     summary: dict,
     started_at: float,
+    cancel: CancelToken,
 ) -> RunResult:
-    """解决一个冲突项（设计 6.5 / 6.6）；`--backup-only` 时只落远端副本。
+    """解决一批冲突项（设计 6.5 / 6.6）；`--backup-only` 时只落远端副本。
 
-    先按正常流程重新分类（所以 `resolve` 也会发出完整的 `plan` 事件，界面据此
-    刷新计划表），再校验目标确实处于冲突态，最后交给 `resolve_conflict`。
+    目标来自 `--only-file` 清单（批量）或单个路径。先按正常流程重新分类
+    （所以 `resolve` 也会发出完整的 `plan` 事件，界面据此刷新计划表），再整批
+    预校验，最后逐条交给 `resolve_conflict`：单项失败不拖累其余项。
     """
-    path = opts.path
-    if not path:
-        raise SyncError("resolve 需要指定要解决的路径", code="no-path")
     if opts.backup_only and opts.keep:
         raise SyncError("--backup-only 与 --keep 不能同时使用", code="bad-flags")
     if not opts.backup_only and opts.keep not in _KEEP_LABELS:
         raise SyncError("resolve 需要 --keep local|remote|merged", code="no-keep")
 
-    classification = plan.get(path)
-    if classification is None:
-        raise SyncError(f"{path} 不在当前计划里", code="not-in-plan")
-    # 已经解决过、状态仍是 conflict 的项会被分类成 BLOCKED，所以两种都接受；
-    # 但 BLOCKED 里还有"远端结构异常"，那种不是冲突，不能放行。
-    if (
-        classification.action != Action.CONFLICT
-        and ctx.state.get_file(path).get("status") != "conflict"
-    ):
-        raise SyncError(
-            f"{path} 当前不是冲突（{classification.action.name}），无需解决",
-            code="not-conflict",
-        )
-
-    local_exists = path in local_snapshot.files
-    remote_exists = path in remote_index
-    page_id = ctx.state.get_file(path).get("page_id") or (
-        remote_index[path]["page_id"] if remote_exists else None
-    )
+    targets = _resolve_targets(opts)
 
     if opts.backup_only:
-        if not remote_exists:
-            raise SyncError(
-                f"{path}: 远端没有这个页面，没有可对比的远端副本", code="no-remote"
-            )
-        return _run_backup_only(ctx, path, page_id, rep, summary, started_at)
+        if len(targets) != 1:
+            raise SyncError("--backup-only 一次只能看一条冲突", code="bad-flags")
+        page_id = _precheck_resolve(
+            targets, plan, ctx, local_snapshot, remote_index, opts
+        )[0][3]
+        return _run_backup_only(ctx, targets[0], page_id, rep, summary, started_at)
 
-    if opts.keep == "merged" and not (local_exists and remote_exists):
-        raise SyncError(
-            f"{path} 两侧不是都有文件，没有可合并的版本", code="bad-keep"
-        )
+    prepared = _precheck_resolve(targets, plan, ctx, local_snapshot, remote_index, opts)
 
     rep.emit("phase", name="execute")
-    rep.emit("file.started", path=path, action="RESOLVE", index=1, total=1)
-    try:
-        result = resolve_conflict(
-            path,
-            opts.keep,
-            ctx.state,
-            ctx.remote,
-            ctx.root,
-            local_exists,
-            remote_exists,
-            page_id,
-        )
-    except Exception as e:
-        summary["failed"] += 1
+    total = len(prepared)
+    for index, (path, local_exists, remote_exists, page_id) in enumerate(prepared, 1):
+        cancel.check()
+        rep.emit("file.started", path=path, action="RESOLVE", index=index, total=total)
+        try:
+            result = resolve_conflict(
+                path,
+                opts.keep,
+                ctx.state,
+                ctx.remote,
+                ctx.root,
+                local_exists,
+                remote_exists,
+                page_id,
+            )
+        except Exception as e:
+            summary["failed"] += 1
+            rep.emit(
+                "file.finished",
+                path=path,
+                action="RESOLVE",
+                result="failed",
+                status="",
+                error=str(e),
+            )
+            rep.emit("progress", done=index, total=total)
+            continue
+
+        _merge(summary, result.summary)
         rep.emit(
             "file.finished",
             path=path,
             action="RESOLVE",
-            result="failed",
+            result="ok",
             status="",
-            error=str(e),
+            error=None,
         )
-        return _finish(rep, EXIT.FAILED, summary, started_at, executed=True)
+        rep.emit("progress", done=index, total=total)
 
-    _merge(summary, result.summary)
-    rep.emit(
-        "file.finished", path=path, action="RESOLVE", result="ok", status="", error=None
-    )
-    rep.emit("progress", done=1, total=1)
+        message = f"已解决：{path}（保留{_KEEP_LABELS[opts.keep]}）"
+        if result.backup:
+            message += f"，放弃的一侧已备份到 {result.backup}"
+        rep.emit("log", level="info", message=message)
 
-    message = f"已解决：{path}（保留{_KEEP_LABELS[opts.keep]}）"
-    if result.backup:
-        message += f"，放弃的一侧已备份到 {result.backup}"
-    rep.emit("log", level="info", message=message)
-    return _finish(rep, EXIT.OK, summary, started_at, executed=True)
+    code = EXIT.FAILED if summary["failed"] else EXIT.OK
+    return _finish(rep, code, summary, started_at, executed=True)
 
 
 def _run_backup_only(ctx, path, page_id, rep, summary, started_at):
@@ -799,6 +889,40 @@ def _check_local_containment(plan, root):
                 continue
         safe[path] = classification
     return safe, errors
+
+
+def _destructive_guard(items, local_snapshot, state_mgr, opts):
+    """执行前的破坏性动作闸（M4，替代原方案的 `--no-expect`）。
+
+    两条规则：
+
+    - 扫描到 0 个文件、state 里却还有已跟踪记录，而这一轮正要把它们归档/删掉：
+      root 被换掉 / 网络盘没挂上 / include 配错时，一轮就能清掉整个远端。
+      没显式给上限就拒绝。
+    - 本轮要执行的破坏性动作（远端归档 / 本地删除）超过 `max_destructive`：拒绝。
+
+    返回拒绝原因，None 表示放行。注意按**过滤后的计划**计数——勾选子集时
+    只数真正会执行的那些。
+    """
+    limit = opts.max_destructive
+    destructive = [p for p, c in items.items() if c.action in _DESTRUCTIVE_ACTIONS]
+
+    tracked = [
+        path for path, entry in state_mgr.state["files"].items() if entry.get("page_id")
+    ]
+    if limit is None and destructive and not local_snapshot.files and tracked:
+        return (
+            f"扫描到 0 个文件，但状态里有 {len(tracked)} 条已跟踪记录，"
+            f"而本轮要执行 {len(destructive)} 个破坏性动作："
+            "目录是不是被换掉了？确认无误后加 --max-destructive 显式放行"
+        )
+
+    if limit is not None and len(destructive) > limit:
+        return (
+            f"本轮计划有 {len(destructive)} 个破坏性动作（归档远端 / 删本地），"
+            f"超过上限 {limit}：确认无误后调大 --max-destructive 再跑"
+        )
+    return None
 
 
 def _warn_push_remote_changes(plan, rep: Reporter):
