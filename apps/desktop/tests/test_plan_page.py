@@ -4,6 +4,8 @@
 进程那一层在 test_engine_client.py 里单独测。
 """
 
+import tempfile
+
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QWidget
@@ -211,8 +213,13 @@ def test_proxy_filters_by_action():
 
 
 @pytest.fixture
-def page(tmp_path, qtbot):
-    """PlanPage + 隔离的界面偏好文件（绝不碰用户真实的配置目录）。"""
+def page(tmp_path, qtbot, monkeypatch):
+    """PlanPage + 隔离的界面偏好文件与临时目录（绝不碰用户真实的配置目录 / 系统 TEMP）。
+
+    临时目录也要隔离：勾选清单走 `tempfile.mkstemp`，默认落在系统 `%TEMP%` 下。
+    用例通常不会走到 `on_run_finished`（那才负责删文件），不重定向就会每跑一次漏一个。
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     settings = UiSettings(tmp_path / "settings.json")
     model = PlanTableModel()
     folder = tmp_path / "sync-root"
@@ -291,7 +298,7 @@ def test_execute_sends_expect_plan(page):
     assert fired == [("sync", ["--expect-plan", "fp-9"])]
 
 
-def test_execute_sends_only_file_for_the_checked_subset(page):
+def test_execute_sends_only_file_for_the_checked_subset(page, tmp_path):
     widget, model, _, _ = page
     model.set_plan("fp-9", [make_row("a.md"), make_row("b.md"), make_row("c.md")])
     model.setData(model.index(1, 0), Qt.Unchecked, Qt.CheckStateRole)
@@ -301,6 +308,9 @@ def test_execute_sends_only_file_for_the_checked_subset(page):
     widget.executeButton.click()
 
     only_file = widget._only_file
+    # 这条用例不跑 on_run_finished（清理在那儿），所以清单必须落在测试自己的临时目录里，
+    # 否则每跑一次就往系统 TEMP 漏一个文件。断言把这条规矩钉住（见 RISKS）。
+    assert only_file.parent == tmp_path
     assert only_file.read_text(encoding="utf-8").split() == ["a.md", "c.md"]
     assert fired == [("sync", ["--expect-plan", "fp-9", "--only-file", str(only_file)])]
 
